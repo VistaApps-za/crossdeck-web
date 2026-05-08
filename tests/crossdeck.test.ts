@@ -1,0 +1,316 @@
+/**
+ * End-to-end tests for the public Crossdeck client. Stubs fetch globally
+ * so we exercise the full SDK code path (start → identify → events → etc.)
+ * without a backend.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { CrossdeckClient } from "../src/crossdeck";
+import { CrossdeckError } from "../src/errors";
+import { MemoryStorage } from "../src/storage";
+
+const ORIG_FETCH = globalThis.fetch;
+
+function jsonResponse(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function newClient(opts: Partial<Parameters<CrossdeckClient["start"]>[0]> = {}) {
+  const c = new CrossdeckClient();
+  c.start({
+    publicKey: "cd_pub_test_001",
+    storage: new MemoryStorage(),
+    autoHeartbeat: false,
+    ...opts,
+  });
+  return c;
+}
+
+beforeEach(() => {
+  // Reset the global fetch before each test
+  globalThis.fetch = ORIG_FETCH;
+});
+afterEach(() => {
+  globalThis.fetch = ORIG_FETCH;
+});
+
+describe("start", () => {
+  it("rejects an invalid publishable key prefix", () => {
+    const c = new CrossdeckClient();
+    expect(() => c.start({ publicKey: "sk_xxxx" as never })).toThrowError(CrossdeckError);
+  });
+
+  it("requires a publishable key", () => {
+    const c = new CrossdeckClient();
+    expect(() => c.start({ publicKey: "" as never })).toThrowError(CrossdeckError);
+  });
+
+  it("auto-heartbeats by default", async () => {
+    const fetchSpy = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        object: "heartbeat",
+        ok: true,
+        projectId: "p",
+        appId: "a",
+        platform: "web",
+        env: "production",
+        serverTime: Date.now(),
+      }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    const c = new CrossdeckClient();
+    c.start({ publicKey: "cd_pub_test_001", storage: new MemoryStorage() });
+    // Wait microtasks for the fire-and-forget heartbeat.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fetchSpy).toHaveBeenCalled();
+    const [url] = fetchSpy.mock.calls[0]!;
+    expect(url).toContain("/sdk/heartbeat");
+  });
+
+  it("does not auto-heartbeat when autoHeartbeat:false", async () => {
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    newClient();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fetchSpy).toHaveBeenCalledTimes(0);
+  });
+});
+
+describe("requireStarted (calling methods before start)", () => {
+  it("throws not_started on every method when start() not called", async () => {
+    const c = new CrossdeckClient();
+    expect(() => c.isEntitled("pro")).toThrowError(CrossdeckError);
+    expect(() => c.track("name")).toThrowError(CrossdeckError);
+    await expect(c.identify("u1")).rejects.toThrow(CrossdeckError);
+    await expect(c.getEntitlements()).rejects.toThrow(CrossdeckError);
+    await expect(c.heartbeat()).rejects.toThrow(CrossdeckError);
+  });
+});
+
+describe("identify", () => {
+  it("calls /v1/identity/alias with userId + anonymousId, persists cdcust", async () => {
+    const c = newClient();
+    const fetchSpy = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        object: "alias_result",
+        crossdeckCustomerId: "cdcust_user_001",
+        linked: [],
+        mergePending: false,
+        env: "production",
+      }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await c.identify("user_847");
+    expect(result.crossdeckCustomerId).toBe("cdcust_user_001");
+    expect(c.diagnostics().crossdeckCustomerId).toBe("cdcust_user_001");
+    expect(c.diagnostics().developerUserId).toBe("user_847");
+
+    const [, init] = fetchSpy.mock.calls[0]!;
+    const body = JSON.parse(init.body as string);
+    expect(body.userId).toBe("user_847");
+    expect(body.anonymousId).toMatch(/^anon_/);
+  });
+
+  it("rejects empty userId", async () => {
+    const c = newClient();
+    await expect(c.identify("")).rejects.toThrow(CrossdeckError);
+  });
+});
+
+describe("getEntitlements + isEntitled", () => {
+  it("populates the cache and answers isEntitled synchronously", async () => {
+    const c = newClient();
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        object: "list",
+        data: [
+          {
+            object: "entitlement",
+            key: "pro",
+            isActive: true,
+            validUntil: null,
+            source: { rail: "stripe", productId: "monthly_pro", subscriptionId: "sub_x" },
+            updatedAt: 1700000000,
+          },
+        ],
+        crossdeckCustomerId: "cdcust_xx",
+        env: "production",
+      }),
+    ) as unknown as typeof fetch;
+
+    expect(c.isEntitled("pro")).toBe(false); // cold cache
+    await c.getEntitlements();
+    expect(c.isEntitled("pro")).toBe(true);
+    expect(c.isEntitled("garbage")).toBe(false);
+    expect(c.diagnostics().crossdeckCustomerId).toBe("cdcust_xx");
+  });
+
+  it("uses customerId in query when cdcust is known", async () => {
+    const c = newClient();
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse(200, {
+          object: "alias_result",
+          crossdeckCustomerId: "cdcust_known",
+          linked: [],
+          mergePending: false,
+          env: "production",
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(200, {
+          object: "list",
+          data: [],
+          crossdeckCustomerId: "cdcust_known",
+          env: "production",
+        }),
+      );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    await c.identify("user_001");
+    await c.getEntitlements();
+    const [url] = fetchSpy.mock.calls[1]!;
+    expect(url).toContain("customerId=cdcust_known");
+  });
+
+  it("uses anonymousId when no cdcust + no userId", async () => {
+    const c = newClient();
+    const fetchSpy = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        object: "list",
+        data: [],
+        crossdeckCustomerId: "",
+        env: "production",
+      }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    await c.getEntitlements();
+    const [url] = fetchSpy.mock.calls[0]!;
+    expect(url).toContain("anonymousId=anon_");
+  });
+});
+
+describe("track + flushEvents", () => {
+  it("queues then sends a batch on flushEvents()", async () => {
+    const c = newClient({ eventFlushBatchSize: 100, eventFlushIntervalMs: 100_000 });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(202, { object: "list", received: 2, env: "production" }),
+      );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    c.track("first");
+    c.track("second", { ctaName: "trial" });
+    expect(fetchSpy).toHaveBeenCalledTimes(0); // still queued
+    await c.flushEvents();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(fetchSpy.mock.calls[0]![1].body as string);
+    expect(body.events.length).toBe(2);
+    expect(body.events[0].name).toBe("first");
+    expect(body.events[1].name).toBe("second");
+    expect(body.events[1].properties).toEqual({ ctaName: "trial" });
+    // Each event carries the anonymous identity hint
+    expect(body.events[0].anonymousId).toMatch(/^anon_/);
+  });
+
+  it("track with empty name throws synchronously", () => {
+    const c = newClient();
+    expect(() => c.track("")).toThrowError(CrossdeckError);
+  });
+
+  it("each event gets a unique eventId", async () => {
+    const c = newClient({ eventFlushBatchSize: 100, eventFlushIntervalMs: 100_000 });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(jsonResponse(202, { object: "list", received: 5, env: "production" }));
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    for (let i = 0; i < 5; i++) c.track(`e${i}`);
+    await c.flushEvents();
+    const body = JSON.parse(fetchSpy.mock.calls[0]![1].body as string) as { events: { eventId: string }[] };
+    const ids = new Set(body.events.map((e) => e.eventId));
+    expect(ids.size).toBe(5);
+  });
+});
+
+describe("reset", () => {
+  it("wipes identity, entitlements, queued events and mints a new anonymousId", async () => {
+    const c = newClient({ eventFlushBatchSize: 100, eventFlushIntervalMs: 100_000 });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(
+        jsonResponse(200, {
+          object: "alias_result",
+          crossdeckCustomerId: "cdcust_x",
+          linked: [],
+          mergePending: false,
+          env: "production",
+        }),
+      );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const before = c.diagnostics().anonymousId;
+    await c.identify("user_001");
+    c.track("evt1");
+    expect(c.diagnostics().crossdeckCustomerId).toBe("cdcust_x");
+    expect(c.diagnostics().events.buffered).toBe(1);
+
+    c.reset();
+    const diag = c.diagnostics();
+    expect(diag.anonymousId).not.toBe(before);
+    expect(diag.crossdeckCustomerId).toBeNull();
+    expect(diag.developerUserId).toBeNull();
+    expect(diag.events.buffered).toBe(0);
+  });
+});
+
+describe("purchaseApple", () => {
+  it("forwards signedTransactionInfo and updates cache from response", async () => {
+    const c = newClient();
+    const fetchSpy = vi.fn().mockResolvedValue(
+      jsonResponse(200, {
+        object: "purchase_result",
+        crossdeckCustomerId: "cdcust_purchase_001",
+        env: "production",
+        entitlements: [
+          {
+            object: "entitlement",
+            key: "pro",
+            isActive: true,
+            validUntil: null,
+            source: { rail: "apple", productId: "monthly_pro", subscriptionId: "1000" },
+            updatedAt: 1700000000,
+          },
+        ],
+      }),
+    );
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await c.purchaseApple({ signedTransactionInfo: "eyJ.test.sig" });
+    expect(result.crossdeckCustomerId).toBe("cdcust_purchase_001");
+    expect(c.isEntitled("pro")).toBe(true);
+
+    const body = JSON.parse(fetchSpy.mock.calls[0]![1].body as string);
+    expect(body.rail).toBe("apple");
+    expect(body.signedTransactionInfo).toBe("eyJ.test.sig");
+  });
+
+  it("rejects empty signedTransactionInfo", async () => {
+    const c = newClient();
+    await expect(c.purchaseApple({ signedTransactionInfo: "" })).rejects.toThrow(CrossdeckError);
+  });
+});
+
+describe("diagnostics", () => {
+  it("returns started:false before start()", () => {
+    const c = new CrossdeckClient();
+    expect(c.diagnostics()).toEqual({ started: false });
+  });
+});
