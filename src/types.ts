@@ -64,12 +64,36 @@ export interface HeartbeatResponse {
 }
 
 /**
- * Configuration for Crossdeck.start. Most fields have sensible defaults
- * — only `publicKey` is mandatory.
+ * Configuration for Crossdeck.init. Three fields are mandatory —
+ * `appId`, `publicKey`, and `environment` — per NorthStar §11.1.
+ *
+ * The pair of (appId, environment) is what we put on the wire envelope
+ * (NorthStar §13.1) so the backend can correlate events against the
+ * specific app surface and refuse mismatched env declarations loudly.
  */
 export interface CrossdeckOptions {
+  /**
+   * Your Crossdeck App ID (e.g. "app_web_xxx"). Required.
+   *
+   * Issued in the dashboard when you create an app. Goes on the wire
+   * envelope so the backend correlates events with the specific app
+   * surface — useful when one project has multiple apps (web + iOS +
+   * Android) sharing the same publishable key family.
+   */
+  appId: string;
   /** Your Crossdeck publishable key (cd_pub_…). Required. */
   publicKey: string;
+  /**
+   * Explicit environment declaration. Required.
+   *
+   * Must match the publishable key's prefix:
+   *   cd_pub_test_…  → "sandbox"
+   *   cd_pub_live_…  → "production"
+   *
+   * Mismatch is rejected at init time so a typo'd key can't silently
+   * route prod telemetry into sandbox dashboards.
+   */
+  environment: Environment;
   /**
    * Override the API base URL. Default is https://api.cross-deck.com/v1.
    * Useful for self-hosted setups or pointing at the local emulator
@@ -120,6 +144,12 @@ export interface CrossdeckOptions {
    * Useful for slicing dashboards by build.
    */
   appVersion?: string;
+  /**
+   * Enable verbose diagnostic logging via the NorthStar §16 debug-signal
+   * vocabulary. Default: false. Equivalent to calling
+   * `Crossdeck.setDebugMode(true)` after init.
+   */
+  debug?: boolean;
 }
 
 /** Auto-tracking flags. See CrossdeckOptions.autoTrack. */

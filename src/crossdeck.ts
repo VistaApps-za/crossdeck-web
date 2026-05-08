@@ -5,7 +5,11 @@
  *
  *   import { Crossdeck } from "@cross-deck/web";
  *
- *   Crossdeck.start({ publicKey: "cd_pub_live_…" });
+ *   Crossdeck.init({
+ *     appId: "app_web_xxx",
+ *     publicKey: "cd_pub_live_…",
+ *     environment: "production",
+ *   });
  *
  *   await Crossdeck.identify("user_847");
  *   const ents = await Crossdeck.getEntitlements();
@@ -17,18 +21,19 @@
  *
  * Usage (Node):
  *
- *   import { Crossdeck } from "@cross-deck/web";
- *   import { MemoryStorage } from "@cross-deck/web";
+ *   import { Crossdeck, MemoryStorage } from "@cross-deck/web";
  *
- *   Crossdeck.start({
+ *   Crossdeck.init({
+ *     appId: "app_node_xxx",
  *     publicKey: "cd_pub_test_…",
+ *     environment: "sandbox",
  *     storage: new MemoryStorage(),  // session-only persistence
  *     autoHeartbeat: false,           // skip the boot ping in scripts
  *   });
  */
 
 import { CrossdeckError } from "./errors";
-import { HttpClient, SDK_VERSION, DEFAULT_BASE_URL } from "./http";
+import { HttpClient, SDK_NAME, SDK_VERSION, DEFAULT_BASE_URL } from "./http";
 import { IdentityStore } from "./identity";
 import { EntitlementCache } from "./entitlement-cache";
 import { EventQueue, type QueuedEvent } from "./event-queue";
@@ -36,12 +41,14 @@ import { detectDefaultStorage, MemoryStorage } from "./storage";
 import { randomChars } from "./identity";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { AutoTracker, DEFAULT_AUTO_TRACK, type AutoTrackConfig } from "./auto-track";
+import { ConsoleDebugLogger, findSensitivePropertyKeys, type DebugLogger } from "./debug";
 import type {
   AliasResult,
   AutoTrackOptions,
   CrossdeckOptions,
   Diagnostics,
   EntitlementsListResponse,
+  Environment,
   EventProperties,
   HeartbeatResponse,
   IdentifyOptions,
@@ -58,12 +65,16 @@ interface InternalState {
   /** Cached enrichment payload merged into every event's properties. */
   deviceInfo: DeviceInfo;
   options: Required<
-    Omit<CrossdeckOptions, "storage" | "sdkVersion" | "autoTrack" | "appVersion">
+    Omit<
+      CrossdeckOptions,
+      "storage" | "sdkVersion" | "autoTrack" | "appVersion" | "debug"
+    >
   > & {
     sdkVersion: string;
     autoTrack: AutoTrackConfig;
     appVersion: string | null;
   };
+  debug: DebugLogger;
   developerUserId: string | null;
 }
 
@@ -71,16 +82,45 @@ export class CrossdeckClient {
   private state: InternalState | null = null;
 
   /**
-   * Boot the SDK. Idempotent — calling start twice with the same options
+   * Boot the SDK. Idempotent — calling init twice with the same options
    * is a no-op; calling with different options replaces the previous
    * configuration.
+   *
+   * NorthStar §11.1: signature is `Crossdeck.init({ appId, publicKey,
+   * environment })`. The trio is validated up-front so a typo'd key or a
+   * mismatched env fails fast at boot rather than at first event-flush.
    */
-  start(options: CrossdeckOptions): void {
+  init(options: CrossdeckOptions): void {
     if (!options.publicKey || !options.publicKey.startsWith("cd_pub_")) {
       throw new CrossdeckError({
         type: "configuration_error",
         code: "invalid_public_key",
-        message: "Crossdeck.start requires a publishable key starting with cd_pub_.",
+        message: "Crossdeck.init requires a publishable key starting with cd_pub_.",
+      });
+    }
+    if (!options.appId) {
+      throw new CrossdeckError({
+        type: "configuration_error",
+        code: "missing_app_id",
+        message: "Crossdeck.init requires an appId. Find yours in the Crossdeck dashboard.",
+      });
+    }
+    if (options.environment !== "production" && options.environment !== "sandbox") {
+      throw new CrossdeckError({
+        type: "configuration_error",
+        code: "invalid_environment",
+        message: 'Crossdeck.init requires environment: "production" | "sandbox".',
+      });
+    }
+    // Key prefix must match the declared environment, otherwise prod
+    // telemetry could silently route into sandbox dashboards (or vice
+    // versa). NorthStar §15 calls this out as a "fail loudly" condition.
+    const keyEnv = inferEnvFromKey(options.publicKey);
+    if (keyEnv && keyEnv !== options.environment) {
+      throw new CrossdeckError({
+        type: "configuration_error",
+        code: "environment_mismatch",
+        message: `Crossdeck.init: environment "${options.environment}" disagrees with key prefix (${keyEnv}). Reconcile the publishable key with the environment declaration.`,
       });
     }
 
@@ -88,7 +128,9 @@ export class CrossdeckClient {
     const persistIdentity = options.persistIdentity ?? true;
     const autoTrack = resolveAutoTrack(options.autoTrack);
     const opts: InternalState["options"] = {
+      appId: options.appId,
       publicKey: options.publicKey,
+      environment: options.environment,
       baseUrl: options.baseUrl ?? DEFAULT_BASE_URL,
       persistIdentity,
       storagePrefix: options.storagePrefix ?? "crossdeck:",
@@ -99,6 +141,9 @@ export class CrossdeckClient {
       autoTrack,
       appVersion: options.appVersion ?? null,
     };
+
+    const debug = new ConsoleDebugLogger();
+    debug.enabled = options.debug === true;
 
     const http = new HttpClient({
       publicKey: opts.publicKey,
@@ -112,6 +157,18 @@ export class CrossdeckClient {
       http,
       batchSize: opts.eventFlushBatchSize,
       intervalMs: opts.eventFlushIntervalMs,
+      envelope: () => ({
+        appId: opts.appId,
+        environment: opts.environment,
+        sdk: { name: SDK_NAME, version: opts.sdkVersion },
+      }),
+      onFirstFlushSuccess: () => {
+        debug.emit(
+          "sdk.first_event_sent",
+          "First telemetry event received. View it in Live Events.",
+          { appId: opts.appId, environment: opts.environment },
+        );
+      },
     });
 
     // Collect device info ONCE at boot; cheap to re-use on every event.
@@ -129,8 +186,15 @@ export class CrossdeckClient {
       autoTracker: null,
       deviceInfo,
       options: opts,
+      debug,
       developerUserId: null,
     };
+
+    debug.emit("sdk.configured", `Crossdeck connected to ${opts.appId} in ${opts.environment} mode.`, {
+      appId: opts.appId,
+      environment: opts.environment,
+      sdkVersion: opts.sdkVersion,
+    });
 
     // Auto-tracker boots AFTER state is set so its initial track() calls
     // can resolve identity hints and device-info enrichment correctly.
@@ -143,9 +207,24 @@ export class CrossdeckClient {
     }
 
     if (opts.autoHeartbeat) {
-      // Fire-and-forget — heartbeat failure shouldn't block start().
+      // Fire-and-forget — heartbeat failure shouldn't block init().
       void this.heartbeat().catch(() => undefined);
     }
+  }
+
+  /**
+   * @deprecated Use `init()` instead. NorthStar §4 standardised the
+   * lifecycle method name across SDKs as `init` (formerly `start` /
+   * `configure`). `start` will be removed in a future major version.
+   */
+  start(options: CrossdeckOptions): void {
+    if (typeof console !== "undefined") {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[crossdeck] Crossdeck.start() is deprecated — use Crossdeck.init() instead. The signature is the same.",
+      );
+    }
+    this.init(options);
   }
 
   /**
@@ -207,7 +286,7 @@ export class CrossdeckClient {
   /**
    * Queue a telemetry event. Returns immediately — the network round-
    * trip happens in the background. To flush before the page unloads,
-   * call flushEvents().
+   * call flush().
    */
   track(name: string, properties?: EventProperties): void {
     const s = this.requireStarted();
@@ -217,6 +296,30 @@ export class CrossdeckClient {
         code: "missing_event_name",
         message: "track(name) requires a non-empty name.",
       });
+    }
+
+    // NorthStar §15: warn (in debug mode) when a property name looks
+    // dangerously like PII — email/password/token/secret/card/phone.
+    // We don't strip the field; that's the developer's call. We just
+    // surface the signal so they can spot accidental leaks early.
+    if (s.debug.enabled && properties) {
+      const flagged = findSensitivePropertyKeys(properties);
+      if (flagged.length > 0) {
+        s.debug.emit(
+          "sdk.sensitive_property_warning",
+          `Event "${name}" has potentially sensitive property names: ${flagged.join(", ")}. Crossdeck is privacy-first — avoid sending PII unless intentional.`,
+          { eventName: name, flagged },
+        );
+      }
+    }
+
+    // §16 "No identity" — only emit once per session so a chatty client
+    // doesn't spam the log with every track() before identify().
+    if (s.debug.enabled && !s.developerUserId && !s.identity.crossdeckCustomerId) {
+      s.debug.emit(
+        "sdk.no_identity",
+        "Using anonymous user until identify(userId) is called.",
+      );
     }
 
     // Enrichment policy: device info first, then auto-tracker context (e.g.
@@ -237,14 +340,31 @@ export class CrossdeckClient {
     s.events.enqueue(event);
   }
 
-  /** Force-flush queued events. Useful to call from page-unload handlers. */
-  async flushEvents(): Promise<void> {
+  /**
+   * Force-flush queued events. Useful to call from page-unload handlers.
+   *
+   * NorthStar §4: standard method name across all Crossdeck SDKs.
+   */
+  async flush(): Promise<void> {
     const s = this.requireStarted();
     await s.events.flush();
   }
 
-  /** Forward an Apple StoreKit 2 transaction for verification + projection. */
-  async purchaseApple(input: {
+  /** @deprecated Use `flush()` instead. NorthStar §4 standardised the name. */
+  async flushEvents(): Promise<void> {
+    return this.flush();
+  }
+
+  /**
+   * Forward purchase evidence to the backend for verification + entitlement
+   * projection. NorthStar §4 + §13 canonical name.
+   *
+   * Today the web SDK only supports Apple StoreKit 2 forwarding (web apps
+   * that sit alongside an iOS app). Stripe doesn't need this method —
+   * Stripe webhooks deliver evidence server-side without a client round-trip.
+   */
+  async syncPurchases(input: {
+    rail?: "apple";
     signedTransactionInfo: string;
     signedRenewalInfo?: string;
     appAccountToken?: string;
@@ -254,15 +374,46 @@ export class CrossdeckClient {
       throw new CrossdeckError({
         type: "invalid_request_error",
         code: "missing_signed_transaction_info",
-        message: "purchaseApple requires a signedTransactionInfo string from StoreKit 2.",
+        message: "syncPurchases requires a signedTransactionInfo string from StoreKit 2.",
       });
     }
-    const result = await s.http.request<PurchaseResult>("POST", "/purchases", {
-      body: { rail: "apple", ...input },
+    const result = await s.http.request<PurchaseResult>("POST", "/purchases/sync", {
+      body: { rail: input.rail ?? "apple", ...input },
     });
     s.identity.setCrossdeckCustomerId(result.crossdeckCustomerId);
     s.entitlements.setFromList(result.entitlements);
+    s.debug.emit(
+      "sdk.purchase_evidence_sent",
+      "StoreKit transaction forwarded. Waiting for backend verification.",
+      { rail: input.rail ?? "apple" },
+    );
     return result;
+  }
+
+  /** @deprecated Use `syncPurchases()` instead. NorthStar §4 standardised the name. */
+  async purchaseApple(input: {
+    signedTransactionInfo: string;
+    signedRenewalInfo?: string;
+    appAccountToken?: string;
+  }): Promise<PurchaseResult> {
+    return this.syncPurchases({ rail: "apple", ...input });
+  }
+
+  /**
+   * Toggle verbose diagnostic logging — NorthStar §16. When enabled, the
+   * SDK emits a fixed vocabulary of debug signals to console.info that the
+   * dashboard's onboarding checklist can also surface as live events.
+   */
+  setDebugMode(enabled: boolean): void {
+    const s = this.requireStarted();
+    s.debug.enabled = enabled;
+    if (enabled) {
+      s.debug.emit(
+        "sdk.configured",
+        `Debug mode enabled for ${s.options.appId} in ${s.options.environment} mode.`,
+        { appId: s.options.appId, environment: s.options.environment },
+      );
+    }
   }
 
   /**
@@ -346,8 +497,9 @@ export class CrossdeckClient {
     if (!this.state) {
       throw new CrossdeckError({
         type: "configuration_error",
-        code: "not_started",
-        message: "Call Crossdeck.start({ publicKey }) before any other method.",
+        code: "not_initialized",
+        message:
+          "Call Crossdeck.init({ appId, publicKey, environment }) before any other method.",
       });
     }
     return this.state;
@@ -399,6 +551,22 @@ export const Crossdeck = new CrossdeckClient();
  *   false          → all off
  *   { sessions:false } → defaults for unspecified flags, override for specified ones
  */
+/**
+ * Derive the env from a publishable key prefix.
+ *   cd_pub_test_… → "sandbox"
+ *   cd_pub_live_… → "production"
+ *   cd_pub_…       → null (legacy / unprefixed — env can't be inferred)
+ *
+ * We treat the legacy form as "no opinion" so the developer's explicit
+ * `environment` declaration always wins for unprefixed keys (e.g. dev
+ * fixture keys in tests).
+ */
+function inferEnvFromKey(publicKey: string): Environment | null {
+  if (publicKey.startsWith("cd_pub_test_")) return "sandbox";
+  if (publicKey.startsWith("cd_pub_live_")) return "production";
+  return null;
+}
+
 function resolveAutoTrack(
   input: CrossdeckOptions["autoTrack"],
 ): AutoTrackConfig {
