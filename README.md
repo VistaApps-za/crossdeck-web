@@ -33,11 +33,45 @@ That's the full happy path.
 
 ## What it does
 
+- **Auto-tracking, on by default.** Sessions, page views, and device info (OS, browser, locale, timezone, screen size, app version) ship from boot. No instrumentation needed for the basics. Disable any of them via `autoTrack: { sessions: false }` etc.
 - **One identity for every device + user.** Pre-login events get an `anonymousId`. After login, `identify()` links them to your user ID through Crossdeck's identity graph. The SDK persists both so subsequent app launches resume where you left off.
 - **Synchronous entitlement reads.** `getEntitlements()` populates a local cache. `isEntitled("pro")` is a Set lookup — no network call, no waiting.
 - **Batched telemetry.** `track()` queues events in memory; the SDK flushes every 5 seconds (configurable) or when the buffer hits 20 events. Network failures re-queue the batch — events aren't lost on a flaky connection.
 - **Boot heartbeat.** On `start()` the SDK pings `/v1/sdk/heartbeat` so the dashboard's Apps page can show you "last seen" per install. Disable with `autoHeartbeat: false`.
 - **Stripe-style errors.** Every async method throws `CrossdeckError` with `type`, `code`, `requestId`, and `status` — same shape as Stripe's SDKs, so generic error handlers transfer.
+
+## Auto-tracked events
+
+| Event | When |
+|---|---|
+| `session.started` | On boot. Carries `sessionId`. |
+| `session.ended` | On `pagehide` / `beforeunload`, OR when returning to a tab after >30 min idle. Carries `sessionId` and `durationMs`. |
+| `page.viewed` | On initial load + every SPA navigation (`history.pushState`, `replaceState`, `popstate`). Carries `path`, `url`, `search`, `hash`, `title`, `referrer`. |
+
+Every event — auto-tracked and developer-emitted — is enriched with the device-info payload below. Quick tab switches (Cmd-Tab, switching browser tabs) don't end the session — only real closes do, matching GA4's session-window convention.
+
+## Auto-attached device info
+
+Every event's `properties` is enriched with whatever the SDK can detect:
+
+```ts
+{
+  os: "macOS" | "iOS" | "Android" | "Windows" | "Linux",
+  osVersion: "14.4",
+  browser: "Safari" | "Chrome" | "Firefox" | "Edge" | "Opera",
+  browserVersion: "17.5",
+  locale: "en-US",
+  timezone: "Africa/Johannesburg",
+  screenWidth: 2560,
+  screenHeight: 1440,
+  viewportWidth: 1440,
+  viewportHeight: 900,
+  devicePixelRatio: 2,
+  appVersion: "1.2.3",   // only when you set Crossdeck.start({ appVersion })
+}
+```
+
+No fingerprinting, no IP collection on the event document, no canvas hashing. Privacy by default. Caller-supplied properties always override auto-detected ones, so you can override `appVersion` per event if you A/B builds.
 
 ## API
 
@@ -49,6 +83,9 @@ Boot the client. Idempotent — calling twice with the same options is fine.
 Crossdeck.start({
   publicKey: "cd_pub_live_…",         // required
   baseUrl: "https://api.cross-deck.com/v1",  // override for self-host or emulator
+  appVersion: "1.2.3",                // attached to every event as properties.appVersion
+  autoTrack: true,                    // default — sessions, page views, device info
+  // …or granular: autoTrack: { sessions: false } keeps page views + device info
   autoHeartbeat: true,                // default; set false for high-frequency boots
   eventFlushBatchSize: 20,            // default
   eventFlushIntervalMs: 5_000,        // default

@@ -101,6 +101,35 @@ export interface CrossdeckOptions {
   eventFlushIntervalMs?: number;
   /** Override the SDK version reported on heartbeats. Default: package version. */
   sdkVersion?: string;
+  /**
+   * Auto-tracking. Default: every flag is `true` in browsers, all
+   * silently no-op in Node.
+   *
+   * Pass `false` to disable everything, or a partial object to override
+   * individual flags:
+   *
+   *   Crossdeck.start({
+   *     publicKey: "...",
+   *     autoTrack: { pageViews: false }, // sessions + deviceInfo still on
+   *   });
+   */
+  autoTrack?: boolean | Partial<AutoTrackOptions>;
+  /**
+   * Your app's version (e.g. "1.2.3"). Auto-attached to every event as
+   * `properties.appVersion` when `autoTrack.deviceInfo` is enabled.
+   * Useful for slicing dashboards by build.
+   */
+  appVersion?: string;
+}
+
+/** Auto-tracking flags. See CrossdeckOptions.autoTrack. */
+export interface AutoTrackOptions {
+  /** Emit `session.started` / `session.ended` automatically. Default true (browser only). */
+  sessions: boolean;
+  /** Emit `page.viewed` on initial load + SPA navigation. Default true (browser only). */
+  pageViews: boolean;
+  /** Auto-attach os/browser/locale/screen/etc to every event's `properties`. Default true (browser only). */
+  deviceInfo: boolean;
 }
 
 /** Minimal interface for any pluggable key-value persistence. */

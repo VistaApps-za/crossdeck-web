@@ -34,8 +34,11 @@ import { EntitlementCache } from "./entitlement-cache";
 import { EventQueue, type QueuedEvent } from "./event-queue";
 import { detectDefaultStorage, MemoryStorage } from "./storage";
 import { randomChars } from "./identity";
+import { collectDeviceInfo, type DeviceInfo } from "./device-info";
+import { AutoTracker, DEFAULT_AUTO_TRACK, type AutoTrackConfig } from "./auto-track";
 import type {
   AliasResult,
+  AutoTrackOptions,
   CrossdeckOptions,
   Diagnostics,
   EntitlementsListResponse,
@@ -51,8 +54,15 @@ interface InternalState {
   identity: IdentityStore;
   entitlements: EntitlementCache;
   events: EventQueue;
-  options: Required<Omit<CrossdeckOptions, "storage" | "sdkVersion">> & {
+  autoTracker: AutoTracker | null;
+  /** Cached enrichment payload merged into every event's properties. */
+  deviceInfo: DeviceInfo;
+  options: Required<
+    Omit<CrossdeckOptions, "storage" | "sdkVersion" | "autoTrack" | "appVersion">
+  > & {
     sdkVersion: string;
+    autoTrack: AutoTrackConfig;
+    appVersion: string | null;
   };
   developerUserId: string | null;
 }
@@ -76,6 +86,7 @@ export class CrossdeckClient {
 
     const storage = options.storage ?? detectDefaultStorage();
     const persistIdentity = options.persistIdentity ?? true;
+    const autoTrack = resolveAutoTrack(options.autoTrack);
     const opts: InternalState["options"] = {
       publicKey: options.publicKey,
       baseUrl: options.baseUrl ?? DEFAULT_BASE_URL,
@@ -85,6 +96,8 @@ export class CrossdeckClient {
       eventFlushBatchSize: options.eventFlushBatchSize ?? 20,
       eventFlushIntervalMs: options.eventFlushIntervalMs ?? 5000,
       sdkVersion: options.sdkVersion ?? SDK_VERSION,
+      autoTrack,
+      appVersion: options.appVersion ?? null,
     };
 
     const http = new HttpClient({
@@ -101,14 +114,33 @@ export class CrossdeckClient {
       intervalMs: opts.eventFlushIntervalMs,
     });
 
+    // Collect device info ONCE at boot; cheap to re-use on every event.
+    const deviceInfo: DeviceInfo = autoTrack.deviceInfo
+      ? collectDeviceInfo({ appVersion: opts.appVersion ?? undefined })
+      : opts.appVersion
+        ? { appVersion: opts.appVersion }
+        : {};
+
     this.state = {
       http,
       identity,
       entitlements,
       events,
+      autoTracker: null,
+      deviceInfo,
       options: opts,
       developerUserId: null,
     };
+
+    // Auto-tracker boots AFTER state is set so its initial track() calls
+    // can resolve identity hints and device-info enrichment correctly.
+    if (autoTrack.sessions || autoTrack.pageViews) {
+      const tracker = new AutoTracker(autoTrack, (name, properties) =>
+        this.track(name, properties),
+      );
+      this.state.autoTracker = tracker;
+      tracker.install();
+    }
 
     if (opts.autoHeartbeat) {
       // Fire-and-forget — heartbeat failure shouldn't block start().
@@ -186,11 +218,20 @@ export class CrossdeckClient {
         message: "track(name) requires a non-empty name.",
       });
     }
+
+    // Enrichment policy: device info first, then auto-tracker context (e.g.
+    // sessionId on session events), then caller-supplied properties last so
+    // a developer can override anything the SDK auto-attached.
+    const enriched: EventProperties = { ...s.deviceInfo };
+    const sessionId = s.autoTracker?.currentSessionId;
+    if (sessionId) enriched.sessionId = sessionId;
+    if (properties) Object.assign(enriched, properties);
+
     const event: QueuedEvent = {
       eventId: this.mintEventId(),
       name,
       timestamp: Date.now(),
-      properties: properties ?? {},
+      properties: enriched,
     };
     Object.assign(event, this.identityHintForEvent());
     s.events.enqueue(event);
@@ -240,10 +281,20 @@ export class CrossdeckClient {
    */
   reset(): void {
     if (!this.state) return;
+    // Tear down + reinstall the auto-tracker so the new session belongs
+    // to the new identity, not the old one.
+    this.state.autoTracker?.uninstall();
     this.state.identity.reset();
     this.state.entitlements.clear();
     this.state.events.reset();
     this.state.developerUserId = null;
+    if (this.state.autoTracker) {
+      const tracker = new AutoTracker(this.state.options.autoTrack, (name, props) =>
+        this.track(name, props),
+      );
+      this.state.autoTracker = tracker;
+      tracker.install();
+    }
   }
 
   /**
@@ -340,3 +391,26 @@ export class CrossdeckClient {
  * Creating extra instances is fine; just `new CrossdeckClient()`.
  */
 export const Crossdeck = new CrossdeckClient();
+
+/**
+ * Normalise the autoTrack option to a fully-resolved AutoTrackConfig.
+ *   undefined      → all defaults (everything on in browsers)
+ *   true           → all on (same as defaults)
+ *   false          → all off
+ *   { sessions:false } → defaults for unspecified flags, override for specified ones
+ */
+function resolveAutoTrack(
+  input: CrossdeckOptions["autoTrack"],
+): AutoTrackConfig {
+  if (input === false) {
+    return { sessions: false, pageViews: false, deviceInfo: false };
+  }
+  if (input === undefined || input === true) {
+    return { ...DEFAULT_AUTO_TRACK };
+  }
+  return {
+    sessions: input.sessions ?? DEFAULT_AUTO_TRACK.sessions,
+    pageViews: input.pageViews ?? DEFAULT_AUTO_TRACK.pageViews,
+    deviceInfo: input.deviceInfo ?? DEFAULT_AUTO_TRACK.deviceInfo,
+  };
+}
