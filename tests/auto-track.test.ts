@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { AutoTracker, DEFAULT_AUTO_TRACK } from "../src/auto-track";
+import { AutoTracker, DEFAULT_AUTO_TRACK, captureAcquisition } from "../src/auto-track";
 
 interface RecordedEvent {
   name: string;
@@ -230,5 +230,67 @@ describe("AutoTracker — session lifecycle", () => {
     const names = ctx.events.map((e) => e.name);
     expect(names).toContain("session.ended");
     expect(names).toContain("session.started");
+  });
+});
+
+// ============================================================
+// v0.6.0 — first-touch acquisition capture (utm_* + referrer)
+// Captured once at session start; attached to every event of the
+// session by Crossdeck.track via tracker.currentAcquisition.
+// ============================================================
+describe("AutoTracker — acquisition capture (v0.6.0)", () => {
+  it("captureAcquisition reads utm_* params off the URL", () => {
+    window.history.replaceState(null, "", "/landing?utm_source=newsletter&utm_medium=email&utm_campaign=launch");
+    const a = captureAcquisition();
+    expect(a.utm_source).toBe("newsletter");
+    expect(a.utm_medium).toBe("email");
+    expect(a.utm_campaign).toBe("launch");
+    expect(a.utm_content).toBe("");
+    expect(a.utm_term).toBe("");
+  });
+
+  it("captureAcquisition returns empty strings for a clean URL with no params", () => {
+    window.history.replaceState(null, "", "/");
+    const a = captureAcquisition();
+    expect(a.utm_source).toBe("");
+    expect(a.utm_medium).toBe("");
+    expect(a.utm_campaign).toBe("");
+  });
+
+  it("currentAcquisition reflects the URL captured AT SESSION START, not on each call", () => {
+    // GA4 contract: utm_* are session-pinned. The user might land on
+    // /?utm_source=newsletter, the SPA might rewrite to /home, but the
+    // session attribution stays "newsletter" for the entire visit.
+    window.history.replaceState(null, "", "/?utm_source=newsletter");
+    const ctx = makeContext();
+    const t = newTracker({}, ctx.track);
+    t.install();
+
+    // Immediately after install, acquisition reflects landing URL
+    expect(t.currentAcquisition.utm_source).toBe("newsletter");
+
+    // SPA navigation strips the params away — but the session's
+    // captured-at-start attribution must NOT change.
+    window.history.replaceState(null, "", "/home");
+    expect(t.currentAcquisition.utm_source).toBe("newsletter");
+  });
+
+  it("resetSession() re-captures acquisition off the current URL (new session = new attribution)", () => {
+    window.history.replaceState(null, "", "/?utm_source=first");
+    const ctx = makeContext();
+    const t = newTracker({}, ctx.track);
+    t.install();
+    expect(t.currentAcquisition.utm_source).toBe("first");
+
+    window.history.replaceState(null, "", "/?utm_source=second");
+    t.resetSession();
+    expect(t.currentAcquisition.utm_source).toBe("second");
+  });
+
+  it("currentAcquisition returns empty values when there is no active session", () => {
+    const t = newTracker({ sessions: false }, makeContext().track);
+    // No install → no session → empty acquisition (not undefined)
+    expect(t.currentAcquisition.utm_source).toBe("");
+    expect(t.currentAcquisition.referrer).toBe("");
   });
 });

@@ -10,13 +10,29 @@
 import { CrossdeckError, crossdeckErrorFromResponse } from "./errors";
 
 export const SDK_NAME = "@cross-deck/web";
-export const SDK_VERSION = "0.3.0";
+export const SDK_VERSION = "0.6.0";
 export const DEFAULT_BASE_URL = "https://api.cross-deck.com/v1";
 
 export interface HttpClientConfig {
   publicKey: string;
   baseUrl: string;
   sdkVersion: string;
+}
+
+export interface HttpRequestOptions {
+  body?: unknown;
+  query?: Record<string, string | undefined>;
+  /**
+   * Mark the request as `keepalive` so the browser keeps it in flight
+   * even after the page begins unloading. Critical for terminal flushes
+   * fired from `pagehide` / `visibilitychange` — without this, the queued
+   * page.viewed / session.ended events get cancelled the moment the user
+   * navigates away.
+   *
+   * Spec: https://developer.mozilla.org/docs/Web/API/Fetch_API/Using_Fetch#sending_a_request_with_keepalive
+   * Body cap: 64 KB total across all keepalive requests in flight.
+   */
+  keepalive?: boolean;
 }
 
 export class HttpClient {
@@ -34,7 +50,7 @@ export class HttpClient {
   async request<T>(
     method: "GET" | "POST",
     path: string,
-    options: { body?: unknown; query?: Record<string, string | undefined> } = {}
+    options: HttpRequestOptions = {}
   ): Promise<T> {
     const url = this.buildUrl(path, options.query);
 
@@ -55,6 +71,7 @@ export class HttpClient {
         method,
         headers,
         body: bodyInit,
+        keepalive: options.keepalive === true,
       });
     } catch (err) {
       throw new CrossdeckError({

@@ -1,9 +1,9 @@
 /**
- * MemoryStorage + detectDefaultStorage tests.
+ * Storage adapter tests — MemoryStorage, detectDefaultStorage, CookieStorage.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { MemoryStorage, detectDefaultStorage } from "../src/storage";
+import { CookieStorage, MemoryStorage, detectDefaultStorage } from "../src/storage";
 
 describe("MemoryStorage", () => {
   it("set/get/remove round-trip", () => {
@@ -76,5 +76,117 @@ describe("detectDefaultStorage", () => {
     (globalThis as { localStorage?: unknown }).localStorage = throwing;
     const storage = detectDefaultStorage();
     expect(storage).toBeInstanceOf(MemoryStorage);
+  });
+});
+
+describe("CookieStorage", () => {
+  // We mock document.cookie via a single shared `cookieJar` string and
+  // track every set so we can verify attributes. Real DOM behaviour
+  // (browser parses `Path=/` etc. and stores per-domain) isn't simulated
+  // beyond the substring checks below — that level of fidelity isn't
+  // worth the test scaffolding complexity for adapter unit tests.
+  const originalDocument = (globalThis as { document?: unknown }).document;
+  let cookieJar: string;
+  let lastSetRaw: string | null;
+
+  beforeEach(() => {
+    cookieJar = "";
+    lastSetRaw = null;
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      writable: true,
+      value: {
+        get cookie() {
+          return cookieJar;
+        },
+        set cookie(raw: string) {
+          lastSetRaw = raw;
+          // Tiny "store the foo=bar piece, drop everything after the
+          // first `;` like a real browser would persist." Negative
+          // Max-Age clears.
+          const head = raw.split(";")[0]!;
+          const [name, ...rest] = head.split("=");
+          const value = rest.join("=");
+          if (raw.includes("Max-Age=0") || raw.includes("Max-Age=-")) {
+            cookieJar = cookieJar
+              .split(/;\s*/)
+              .filter((c) => !c.startsWith(name + "="))
+              .join("; ");
+          } else {
+            const without = cookieJar
+              .split(/;\s*/)
+              .filter((c) => c && !c.startsWith(name + "="))
+              .join("; ");
+            cookieJar = without ? without + "; " + name + "=" + value : name + "=" + value;
+          }
+        },
+      },
+    });
+  });
+
+  afterEach(() => {
+    if (originalDocument === undefined) {
+      // jsdom default — restore by deleting our override
+      delete (globalThis as { document?: unknown }).document;
+    } else {
+      Object.defineProperty(globalThis, "document", {
+        configurable: true,
+        writable: true,
+        value: originalDocument,
+      });
+    }
+  });
+
+  it("set/get/remove round-trip", () => {
+    const s = new CookieStorage();
+    expect(s.getItem("crossdeck:anon_id")).toBeNull();
+    s.setItem("crossdeck:anon_id", "anon_abc");
+    expect(s.getItem("crossdeck:anon_id")).toBe("anon_abc");
+    s.removeItem("crossdeck:anon_id");
+    expect(s.getItem("crossdeck:anon_id")).toBeNull();
+  });
+
+  it("URL-encodes keys and values to survive the cookie syntax", () => {
+    const s = new CookieStorage();
+    s.setItem("crossdeck:has space", "value;with;semicolons=and=equals");
+    expect(s.getItem("crossdeck:has space")).toBe("value;with;semicolons=and=equals");
+  });
+
+  it("emits Path=/ + SameSite=Lax + Max-Age + Secure when over HTTPS", () => {
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: { protocol: "https:" },
+    });
+    const s = new CookieStorage();
+    s.setItem("k", "v");
+    expect(lastSetRaw).toContain("Path=/");
+    expect(lastSetRaw).toContain("SameSite=Lax");
+    expect(lastSetRaw).toContain("Max-Age=63072000");
+    expect(lastSetRaw).toContain("Secure");
+  });
+
+  it("omits Secure when on http: (so localhost dev still works)", () => {
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: { protocol: "http:" },
+    });
+    const s = new CookieStorage();
+    s.setItem("k", "v");
+    expect(lastSetRaw).not.toContain("Secure");
+  });
+
+  it("returns null on broken cookie strings without throwing", () => {
+    const s = new CookieStorage();
+    cookieJar = "garbage=%%%; nothing=";
+    expect(s.getItem("garbage")).toBeNull();
+  });
+
+  it("getItem returns null when document is absent (Node)", () => {
+    delete (globalThis as { document?: unknown }).document;
+    const s = new CookieStorage();
+    expect(s.getItem("k")).toBeNull();
+    // setItem must also no-op silently — never throw in Node
+    expect(() => s.setItem("k", "v")).not.toThrow();
+    expect(() => s.removeItem("k")).not.toThrow();
   });
 });

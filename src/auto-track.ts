@@ -52,7 +52,38 @@ interface SessionState {
   startedAt: number;
   hiddenAt: number | null;
   endedSent: boolean;
+  /**
+   * Acquisition context captured once at session start. GA4 calls
+   * this "first-touch attribution within the session." We attach
+   * these to every event of the session so dashboards can answer
+   * "what was the source of users who triggered paywall_shown" — a
+   * per-event lookup against the captured-once state, not a re-parse
+   * of the URL on every track().
+   *
+   * Empty strings (not undefined) so JSON envelope serialisation
+   * stays uniform — backend's extractAcquisition handles "" the
+   * same as missing.
+   */
+  acquisition: SessionAcquisition;
 }
+
+export interface SessionAcquisition {
+  utm_source: string;
+  utm_medium: string;
+  utm_campaign: string;
+  utm_content: string;
+  utm_term: string;
+  referrer: string;
+}
+
+const EMPTY_ACQUISITION: SessionAcquisition = {
+  utm_source: "",
+  utm_medium: "",
+  utm_campaign: "",
+  utm_content: "",
+  utm_term: "",
+  referrer: "",
+};
 
 export class AutoTracker {
   private session: SessionState | null = null;
@@ -90,6 +121,19 @@ export class AutoTracker {
   /** Exposed for inspection/tests — returns the current sessionId (or null if not in a session). */
   get currentSessionId(): string | null {
     return this.session?.sessionId ?? null;
+  }
+
+  /**
+   * Per-session acquisition context — utm_* + referrer, captured once
+   * at session start. Returns empty strings when there's no session
+   * (Node, before init, after uninstall) so callers can spread without
+   * conditional logic. Bank-grade rule: capture once, attach to every
+   * event of the session, don't re-read on every track() (the URL
+   * changes via SPA pushState; the source-of-record is the URL we
+   * landed on).
+   */
+  get currentAcquisition(): SessionAcquisition {
+    return this.session?.acquisition ?? EMPTY_ACQUISITION;
   }
 
   // ---------- sessions ----------
@@ -147,6 +191,7 @@ export class AutoTracker {
       startedAt: Date.now(),
       hiddenAt: null,
       endedSent: false,
+      acquisition: captureAcquisition(),
     };
   }
 
@@ -248,4 +293,43 @@ function mintSessionId(): string {
   // Inline the same shape used elsewhere — `<prefix>_<base32-ts><10-char-rand>`.
   const ts = Date.now().toString(36);
   return `sess_${ts}${randomChars(10)}`;
+}
+
+/**
+ * Read first-touch acquisition signals off the current page. Captures:
+ *   - utm_source, utm_medium, utm_campaign, utm_content, utm_term
+ *     (the standard Google Analytics campaign params)
+ *   - referrer (full URL — backend extracts hostname for grouping)
+ *
+ * Returns empty strings outside a browser, before navigation, or when
+ * the page has none of these signals. Never throws — a malformed URL
+ * or an iframe with no document.referrer falls through to empty.
+ *
+ * Pure function. Exported for unit testing acquisition extraction.
+ */
+export function captureAcquisition(): SessionAcquisition {
+  if (!isBrowserSafe()) return { ...EMPTY_ACQUISITION };
+
+  const result: SessionAcquisition = { ...EMPTY_ACQUISITION };
+
+  try {
+    const w = (globalThis as { window: Window }).window;
+    const params = new URLSearchParams(w.location.search ?? "");
+    result.utm_source = params.get("utm_source") ?? "";
+    result.utm_medium = params.get("utm_medium") ?? "";
+    result.utm_campaign = params.get("utm_campaign") ?? "";
+    result.utm_content = params.get("utm_content") ?? "";
+    result.utm_term = params.get("utm_term") ?? "";
+  } catch {
+    // window.location can throw in sandboxed iframes / data: URLs
+  }
+
+  try {
+    const doc = (globalThis as { document: Document }).document;
+    if (typeof doc.referrer === "string") result.referrer = doc.referrer;
+  } catch {
+    // document.referrer is well-supported but defensive in case
+  }
+
+  return result;
 }

@@ -11,27 +11,65 @@ npm install @cross-deck/web
 ```ts
 import { Crossdeck } from "@cross-deck/web";
 
-// 1. Boot once at app start
+// 1. Boot once at app start. Synchronous and idempotent.
 Crossdeck.init({
   appId: "app_web_xxx",         // from the Crossdeck dashboard
   publicKey: "cd_pub_live_…",   // publishable key, safe in client code
   environment: "production",    // "production" or "sandbox"
 });
 
-// 2. After the user logs in, link the device to your user ID
-await Crossdeck.identify("user_847");
+// 2. Telemetry — fire-and-forget, batched in the background.
+Crossdeck.track("paywall_viewed", { variant: "v3" });
 
-// 3. Read entitlements (warms the local cache)
-await Crossdeck.getEntitlements();
+// 3. Auth + entitlements happen inside an async boot function (or a
+//    React useEffect, or any other async context). Top-level await is
+//    not portable across all bundlers.
+async function bootCrossdeck() {
+  // Wire identify() to YOUR auth state — never hardcode a placeholder.
+  await Crossdeck.identify(currentUser.id);
+  await Crossdeck.getEntitlements();   // warm the local cache
 
-// 4. Sync access checks (microsecond reads from cache)
-if (Crossdeck.isEntitled("pro")) {
-  showProFeatures();
+  // 4. Sync access checks (microsecond reads from cache).
+  if (Crossdeck.isEntitled("pro")) {
+    showProFeatures();
+  }
+}
+```
+
+### React quick start
+
+For React apps, install Crossdeck once at the root and use the
+`useEntitlement` hook from `@cross-deck/web/react` so components
+re-render when entitlements arrive:
+
+```tsx
+"use client"
+import { useEffect } from "react";
+import { Crossdeck } from "@cross-deck/web";
+import { useEntitlement } from "@cross-deck/web/react";
+
+export function CrossdeckProvider({ children }) {
+  useEffect(() => {
+    Crossdeck.init({
+      appId: "app_web_xxx",
+      publicKey: "cd_pub_live_…",
+      environment: "production",
+    });
+    Crossdeck.getEntitlements();   // warm the cache (fire-and-forget)
+  }, []);
+  return children;
 }
 
-// 5. Telemetry — fire-and-forget, batched in the background
-Crossdeck.track("paywall_viewed", { variant: "v3" });
+export function ProBadge() {
+  const isPro = useEntitlement("pro");
+  return isPro ? <span className="badge">Pro</span> : null;
+}
 ```
+
+`useEntitlement` subscribes to the SDK's reactive cache via
+`Crossdeck.onEntitlementsChange()`, so every component using the hook
+re-renders the moment entitlements change. SSR-safe: returns `false`
+on the server and hydrates correctly on the client.
 
 That's the full happy path.
 
@@ -54,6 +92,8 @@ That's the full happy path.
 
 Every event — auto-tracked and developer-emitted — is enriched with the device-info payload below. Quick tab switches (Cmd-Tab, switching browser tabs) don't end the session — only real closes do, matching GA4's session-window convention.
 
+**Per-session acquisition (v0.6.0+):** when a session starts the SDK reads `window.location.search` and `document.referrer` and captures `utm_source`, `utm_medium`, `utm_campaign`, `utm_content`, `utm_term`, plus `referrer`. Non-empty values are auto-attached to every subsequent event of that session — first-touch attribution stays pinned to the entry URL even after SPA route changes strip the params away. A new session (>30 min idle) re-reads the URL.
+
 ## Auto-attached device info
 
 Every event's `properties` is enriched with whatever the SDK can detect:
@@ -71,7 +111,7 @@ Every event's `properties` is enriched with whatever the SDK can detect:
   viewportWidth: 1440,
   viewportHeight: 900,
   devicePixelRatio: 2,
-  appVersion: "1.2.3",   // only when you set Crossdeck.start({ appVersion })
+  appVersion: "1.2.3",   // only when you set Crossdeck.init({ appVersion })
 }
 ```
 
@@ -157,11 +197,14 @@ In `debug: true` mode the SDK warns (one signal per call) when property keys loo
 Forward purchase evidence (Apple StoreKit 2) directly to Crossdeck for verification — closes the purchase-to-entitled latency from seconds to milliseconds (faster than waiting for the App Store webhook). (`purchaseApple()` is kept as a deprecated alias.)
 
 ```ts
-await Crossdeck.syncPurchases({
-  signedTransactionInfo: transaction.jsonRepresentation,  // from StoreKit 2
-  signedRenewalInfo: subscription.signedRenewalInfo,      // optional
-  appAccountToken: "uuid-…",                              // optional
-});
+// Inside an async transaction handler — wrap top-level awaits.
+async function forwardTransaction(transaction) {
+  await Crossdeck.syncPurchases({
+    signedTransactionInfo: transaction.jsonRepresentation, // from StoreKit 2
+    signedRenewalInfo: subscription.signedRenewalInfo,     // optional
+    appAccountToken: "uuid-…",                             // optional
+  });
+}
 ```
 
 Stripe and Google purchases are verified via webhooks (Stripe Connect platform endpoint, Google Play RTDN) — there's no SDK-side push for those.
@@ -254,6 +297,23 @@ Publishable keys aren't secrets — they're identifiers, safe to ship in client 
 - **Tenant isolation** — a leaked key can read its own project's customer data only, never another tenant's.
 - **Env partition** — a `cd_pub_live_…` key cannot read `cd_pub_test_…` data and vice versa.
 - **No raw payment credentials** ever pass through this SDK or sit in a Crossdeck database. Apple `.p8`s, Stripe secret keys, Google service-account JSON — all in Google Cloud Secret Manager, runtime-only access from the Crossdeck backend.
+
+## Identity & cookies (v0.6.0+)
+
+The SDK persists `anonymousId` and `crossdeckCustomerId` so a returning user keeps the same Crossdeck identity across page loads. By default in browsers it writes to BOTH `localStorage` (primary) and a 1st-party `document.cookie` (secondary, `Path=/`, `Max-Age=2y`, `SameSite=Lax`, `Secure` over HTTPS). The redundancy keeps "10k unique visitors" actually meaning 10k humans even when one store is wiped by ITP, private browsing, or "clear site data."
+
+The cookie holds only the same `anonymousId` already in `localStorage` — no fingerprintable data, no PII. Same security posture as Stripe, Segment, and PostHog's 1st-party identity cookies.
+
+**Disabling persistence.** Customers running strict consent flows (e.g. cookies disabled until the visitor opts in via a consent banner) should pass `persistIdentity: false` to `Crossdeck.init`. That switches the SDK to in-memory only — no `localStorage`, no cookie, identity is recreated on every page load. Re-`init` with `persistIdentity: true` once consent lands.
+
+```ts
+Crossdeck.init({
+  appId, publicKey, environment,
+  persistIdentity: false,  // strict consent — opt in later
+});
+```
+
+**Cookie disclosure.** If your privacy policy enumerates cookies, list this one as a "1st-party functional / analytics cookie used to keep the same visitor identity across page loads." The Crossdeck cookie name uses the configured `storagePrefix` (default `crossdeck:`) followed by `anon_id` (and `cdcust_id` once a user signs in).
 
 ## Versioning
 

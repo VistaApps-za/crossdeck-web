@@ -97,8 +97,12 @@ export class EventQueue {
    * Flush the buffer to /v1/events. Resolves when the network call
    * completes (success or failure). On failure, events stay in the
    * buffer for the next flush attempt.
+   *
+   * `options.keepalive` marks the underlying fetch as keepalive so the
+   * browser keeps the request alive past page unload. Use this for
+   * terminal flushes (pagehide / visibilitychange→hidden / beforeunload).
    */
-  async flush(): Promise<IngestResponse | null> {
+  async flush(options: { keepalive?: boolean } = {}): Promise<IngestResponse | null> {
     if (this.buffer.length === 0) return null;
     this.cancelTimerIfSet();
 
@@ -119,6 +123,7 @@ export class EventQueue {
           sdk: env.sdk,
           events: batch,
         },
+        keepalive: options.keepalive === true,
       });
       this.lastFlushAt = Date.now();
       this.lastError = null;

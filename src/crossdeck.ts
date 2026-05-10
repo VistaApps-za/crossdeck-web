@@ -35,9 +35,9 @@
 import { CrossdeckError } from "./errors";
 import { HttpClient, SDK_NAME, SDK_VERSION, DEFAULT_BASE_URL } from "./http";
 import { IdentityStore } from "./identity";
-import { EntitlementCache } from "./entitlement-cache";
+import { EntitlementCache, type EntitlementsListener } from "./entitlement-cache";
 import { EventQueue, type QueuedEvent } from "./event-queue";
-import { detectDefaultStorage, MemoryStorage } from "./storage";
+import { CookieStorage, detectDefaultStorage, MemoryStorage } from "./storage";
 import { randomChars } from "./identity";
 import { collectDeviceInfo, type DeviceInfo } from "./device-info";
 import { AutoTracker, DEFAULT_AUTO_TRACK, type AutoTrackConfig } from "./auto-track";
@@ -76,6 +76,8 @@ interface InternalState {
   };
   debug: DebugLogger;
   developerUserId: string | null;
+  /** Cleanup the unload-flush listeners installed in init(). */
+  uninstallUnloadFlush: (() => void) | null;
 }
 
 export class CrossdeckClient {
@@ -136,7 +138,11 @@ export class CrossdeckClient {
       storagePrefix: options.storagePrefix ?? "crossdeck:",
       autoHeartbeat: options.autoHeartbeat ?? true,
       eventFlushBatchSize: options.eventFlushBatchSize ?? 20,
-      eventFlushIntervalMs: options.eventFlushIntervalMs ?? 5000,
+      // 1500ms idle window. Short enough that an event queued on page
+      // load still flushes if the user leaves quickly (the keepalive
+      // pagehide handler picks up anything that doesn't); long enough
+      // that bursts of clicks coalesce into one network round-trip.
+      eventFlushIntervalMs: options.eventFlushIntervalMs ?? 1500,
       sdkVersion: options.sdkVersion ?? SDK_VERSION,
       autoTrack,
       appVersion: options.appVersion ?? null,
@@ -150,8 +156,24 @@ export class CrossdeckClient {
       baseUrl: opts.baseUrl,
       sdkVersion: opts.sdkVersion,
     });
+    // Bank-grade identity continuity (v0.6.0+). When persistIdentity is
+    // on AND we're in a browser, the SDK writes the anonymousId to BOTH
+    // localStorage (primary) and a 1st-party cookie (secondary). When
+    // persistIdentity is off — typical during a strict-consent flow
+    // before opt-in — we fall back to in-memory only and write nothing
+    // to either store.
+    //
+    // The cookie is only constructed when the caller didn't override
+    // `storage`; if a custom storage adapter was supplied, that wins
+    // and the cookie redundancy is the caller's responsibility (they
+    // chose a non-default store for a reason).
     const effectiveStorage = persistIdentity ? storage : new MemoryStorage();
-    const identity = new IdentityStore(effectiveStorage, opts.storagePrefix);
+    const useCookieRedundancy =
+      persistIdentity &&
+      !options.storage &&  // honour caller's adapter choice
+      typeof (globalThis as { document?: unknown }).document !== "undefined";
+    const cookieStore = useCookieRedundancy ? new CookieStorage() : undefined;
+    const identity = new IdentityStore(effectiveStorage, opts.storagePrefix, cookieStore);
     const entitlements = new EntitlementCache();
     const events = new EventQueue({
       http,
@@ -188,6 +210,7 @@ export class CrossdeckClient {
       options: opts,
       debug,
       developerUserId: null,
+      uninstallUnloadFlush: null,
     };
 
     debug.emit("sdk.configured", `Crossdeck connected to ${opts.appId} in ${opts.environment} mode.`, {
@@ -205,6 +228,20 @@ export class CrossdeckClient {
       this.state.autoTracker = tracker;
       tracker.install();
     }
+
+    // Terminal flush wiring — without this, every page navigation drops
+    // whatever's queued (page.viewed on load, session.ended on pagehide,
+    // user clicks within the idle window). Use keepalive so the request
+    // survives the unload. visibilitychange→hidden is the canonical
+    // mobile signal (pagehide also fires there); pagehide + beforeunload
+    // are the desktop ones. We listen to all three and rely on the
+    // queue being a no-op when empty so a single trigger flushes once.
+    this.state.uninstallUnloadFlush = installUnloadFlush(() => {
+      // Fire-and-forget. Errors here can't be handled meaningfully — the
+      // page is going away. Keepalive lets the browser keep the request
+      // alive past unload up to 64 KB total in flight.
+      void this.flush({ keepalive: true }).catch(() => undefined);
+    });
 
     if (opts.autoHeartbeat) {
       // Fire-and-forget — heartbeat failure shouldn't block init().
@@ -284,6 +321,38 @@ export class CrossdeckClient {
   }
 
   /**
+   * Subscribe to entitlement-cache changes. Returns an unsubscribe fn.
+   *
+   * The listener is invoked AFTER the cache mutates — once after a
+   * successful `getEntitlements()` warms it, again after `syncPurchases()`
+   * delivers fresh entitlements, and once on `reset()` to fire the
+   * empty-cache state for logout flows.
+   *
+   * It is NOT invoked synchronously on subscribe. Callers that need
+   * the current state should read it via `isEntitled()` / `listEntitlements()`
+   * inline; the listener fires only on FUTURE changes.
+   *
+   * This is the foundation of the `useEntitlement` React hook in
+   * `@cross-deck/web/react` — without it, React (or SwiftUI / Compose
+   * / Vue) would have no way to re-render when entitlements arrive
+   * asynchronously after init. The naive pattern of calling
+   * `Crossdeck.isEntitled("pro")` directly inside a render path
+   * shows the empty-cache result forever; binding the result to
+   * component state via `onEntitlementsChange` is the correct
+   * pattern.
+   *
+   * Idempotent unsubscribe — calling the returned function multiple
+   * times is safe.
+   *
+   * Listener errors are swallowed (a buggy listener can't crash the
+   * SDK or other listeners).
+   */
+  onEntitlementsChange(listener: EntitlementsListener): () => void {
+    const s = this.requireStarted();
+    return s.entitlements.subscribe(listener);
+  }
+
+  /**
    * Queue a telemetry event. Returns immediately — the network round-
    * trip happens in the background. To flush before the page unloads,
    * call flush().
@@ -322,12 +391,28 @@ export class CrossdeckClient {
       );
     }
 
-    // Enrichment policy: device info first, then auto-tracker context (e.g.
-    // sessionId on session events), then caller-supplied properties last so
-    // a developer can override anything the SDK auto-attached.
+    // Enrichment policy: device info first, then auto-tracker context
+    // (sessionId + per-session acquisition utm_*/referrer), then
+    // caller-supplied properties last so a developer can override
+    // anything the SDK auto-attached.
+    //
+    // Acquisition fields are session-scoped (captured once at session
+    // start by AutoTracker) and attached to every event of that session
+    // — that's the GA4 model: same source/medium/campaign labels every
+    // event in the same visit. Empty strings are filtered out so we
+    // don't pollute event property dictionaries with no-signal columns.
     const enriched: EventProperties = { ...s.deviceInfo };
     const sessionId = s.autoTracker?.currentSessionId;
     if (sessionId) enriched.sessionId = sessionId;
+    const acquisition = s.autoTracker?.currentAcquisition;
+    if (acquisition) {
+      if (acquisition.utm_source) enriched.utm_source = acquisition.utm_source;
+      if (acquisition.utm_medium) enriched.utm_medium = acquisition.utm_medium;
+      if (acquisition.utm_campaign) enriched.utm_campaign = acquisition.utm_campaign;
+      if (acquisition.utm_content) enriched.utm_content = acquisition.utm_content;
+      if (acquisition.utm_term) enriched.utm_term = acquisition.utm_term;
+      if (acquisition.referrer) enriched.referrer = acquisition.referrer;
+    }
     if (properties) Object.assign(enriched, properties);
 
     const event: QueuedEvent = {
@@ -343,11 +428,16 @@ export class CrossdeckClient {
   /**
    * Force-flush queued events. Useful to call from page-unload handlers.
    *
+   * Pass `{ keepalive: true }` from terminal handlers (pagehide /
+   * visibilitychange→hidden / beforeunload). The browser keeps the
+   * request alive after the page tears down, so the final batch
+   * actually lands instead of being cancelled with the unload.
+   *
    * NorthStar §4: standard method name across all Crossdeck SDKs.
    */
-  async flush(): Promise<void> {
+  async flush(options: { keepalive?: boolean } = {}): Promise<void> {
     const s = this.requireStarted();
-    await s.events.flush();
+    await s.events.flush(options);
   }
 
   /** @deprecated Use `flush()` instead. NorthStar §4 standardised the name. */
@@ -433,7 +523,9 @@ export class CrossdeckClient {
   reset(): void {
     if (!this.state) return;
     // Tear down + reinstall the auto-tracker so the new session belongs
-    // to the new identity, not the old one.
+    // to the new identity, not the old one. Unload-flush listeners stay
+    // installed across reset — they're tied to the SDK lifetime, not
+    // the identity lifetime.
     this.state.autoTracker?.uninstall();
     this.state.identity.reset();
     this.state.entitlements.clear();
@@ -580,5 +672,43 @@ function resolveAutoTrack(
     sessions: input.sessions ?? DEFAULT_AUTO_TRACK.sessions,
     pageViews: input.pageViews ?? DEFAULT_AUTO_TRACK.pageViews,
     deviceInfo: input.deviceInfo ?? DEFAULT_AUTO_TRACK.deviceInfo,
+  };
+}
+
+/**
+ * Install browser unload listeners that fire `onUnload` when the page
+ * is going away. We listen to all three because each browser/platform
+ * is unreliable on at least one of them:
+ *   - `pagehide` is the modern, mobile-reliable signal (Safari iOS only
+ *     fires this — beforeunload doesn't fire on backgrounding there).
+ *   - `visibilitychange → hidden` is the canonical "tab going to bg"
+ *     signal; bfcache restores re-fire `pagehide`/`pageshow`.
+ *   - `beforeunload` is the legacy desktop signal — kept as a belt for
+ *     older Chrome/Firefox versions.
+ *
+ * The handler is idempotent: if the queue is empty, flush() is a no-op,
+ * so multiple firings during one unload are harmless.
+ *
+ * Returns a teardown that removes all three listeners. No-ops in non-
+ * browser environments (Node, Web Workers).
+ */
+function installUnloadFlush(onUnload: () => void): () => void {
+  const w = (globalThis as { window?: Window }).window;
+  const doc = (globalThis as { document?: Document }).document;
+  if (!w || !doc) return () => undefined;
+
+  const onVisChange = (): void => {
+    if (doc.visibilityState === "hidden") onUnload();
+  };
+  const onTerminal = (): void => onUnload();
+
+  doc.addEventListener("visibilitychange", onVisChange);
+  w.addEventListener("pagehide", onTerminal);
+  w.addEventListener("beforeunload", onTerminal);
+
+  return () => {
+    doc.removeEventListener("visibilitychange", onVisChange);
+    w.removeEventListener("pagehide", onTerminal);
+    w.removeEventListener("beforeunload", onTerminal);
   };
 }
