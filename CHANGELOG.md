@@ -12,7 +12,7 @@ All notable changes to `@cross-deck/web` will be documented here. The format fol
 ### Changed
 
 - **The entitlement cache is cleared on `reset()` and on an identity switch**, so a prior user's entitlements never leak to the next person on the same device.
-- **Bundle-size budget — `core CJS` 32 KB → 33 KB.** The CJS build includes CommonJS boilerplate the ESM build avoids, and small additions during the dashboard + docs pass pushed gzipped CJS from 31.95 KB → 32.11 KB. ESM (`index.mjs`) and framework builds (`react.mjs`, `vue.mjs`) stay at 32 KB — that's what most modern stacks ship. Still well under the competitive ceiling: Sentry 30 KB (errors only), Mixpanel 55 KB (analytics only), PostHog 40 KB (analytics only). One SDK, three pillars, 33 KB CJS. See `sdks/web/scripts/check-bundle-size.mjs`.
+- **Bundle-size budgets raised** to fit the durable cache. Device-storage persistence, boot hydration, and refresh-failure tracking are ~0.8 KB gzipped of real code. New gzipped budgets: `core ESM` 32 → 33 KB (32.81 KB actual), `core CJS` 33 → 34 KB (33.27 KB actual — CJS also carries CommonJS boilerplate the ESM build avoids), `react.mjs` / `vue.mjs` 32 → 33 KB. The UMD build holds at 18 KB. Still well under the single-pillar competitive ceiling — Sentry 30 KB (errors only), Mixpanel 55 KB (analytics only), PostHog 40 KB (analytics only) — for one bundle that ships all three pillars. See `sdks/web/scripts/check-bundle-size.mjs`.
 
 ## [1.0.1] — 2026-05-13
 

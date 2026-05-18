@@ -35,18 +35,21 @@ const distDir = path.resolve(new URL(".", import.meta.url).pathname, "../dist");
 //
 // Crossdeck at ~30 KB ships all three (analytics + revenue + errors)
 // in one bundle — competitive with single-pillar SDKs.
-// CJS budget at 33 KB (May 2026): the CJS bundle includes CommonJS
-// boilerplate that the ESM build avoids, plus all three pillars
-// (analytics + revenue + errors) had small additions during the
-// docs / playbook pass. Still well under the competitive ceiling
-// (Sentry 30 KB errors-only, Mixpanel 55 KB analytics-only,
-// PostHog 40 KB analytics-only). ESM and the framework builds stay
-// at 32 KB — they're what most modern stacks ship.
+// Budgets raised for v1.1.0 (May 2026): the durable last-known-good
+// entitlement cache + staleness signal add device-storage
+// persistence, boot hydration, and refresh-failure tracking —
+// ~0.8 KB gzipped of real code. core ESM 32 → 33 KB, core CJS
+// 33 → 34 KB (CJS also carries CommonJS boilerplate the ESM build
+// avoids), react / vue ESM 32 → 33 KB. The UMD build holds at 18 KB.
+// Still well under the single-pillar competitive ceiling — Sentry
+// 30 KB (errors-only), Mixpanel 55 KB (analytics-only), PostHog
+// 40 KB (analytics-only) — for one bundle that ships all three
+// pillars.
 const BUDGETS = [
-  { file: "index.mjs", maxGzipKb: 32, label: "core ESM" },
-  { file: "index.cjs", maxGzipKb: 33, label: "core CJS" },
-  { file: "react.mjs", maxGzipKb: 32, label: "react ESM" },
-  { file: "vue.mjs", maxGzipKb: 32, label: "vue ESM" },
+  { file: "index.mjs", maxGzipKb: 33, label: "core ESM" },
+  { file: "index.cjs", maxGzipKb: 34, label: "core CJS" },
+  { file: "react.mjs", maxGzipKb: 33, label: "react ESM" },
+  { file: "vue.mjs", maxGzipKb: 33, label: "vue ESM" },
   { file: "crossdeck.umd.min.js", maxGzipKb: 18, label: "UMD min" },
 ];
 
