@@ -28,8 +28,117 @@
  * SDK ships).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Crossdeck } from "./crossdeck";
+import type { CrossdeckOptions } from "./types";
+
+// ─────────────────────────────────────────────────────────────────
+// <CrossdeckProvider> — one-line React integration.
+//
+// What it does for the consumer:
+//   1. Calls Crossdeck.init({ appId, publicKey, environment, ...rest })
+//      once on first mount. React StrictMode re-mounts are de-duped
+//      via a module-level "initialised" flag so init never runs twice.
+//   2. Mirrors the `userId` prop into the SDK identity:
+//        userId provided + changed → Crossdeck.identify(userId)
+//        userId removed (logout)   → Crossdeck.reset()
+//      Both calls are idempotent against the SDK — no extra wire-up.
+//   3. Renders children unchanged. No context, no provider DOM node —
+//      the SDK is a singleton, the "provider" is a side-effect mount
+//      point that happens to look like a React provider.
+//
+// Why this exists: the dashboard's Next.js install prompt promised a
+// <CrossdeckProvider userId={…} appId={…} publicKey={…} environment={…}>
+// for months while @cross-deck/web/react only shipped useEntitlement /
+// useEntitlements. Customers pasted the prompt verbatim, got an import
+// error, fell off onboarding. This component closes the gap so the
+// prompt's 8-line recipe is now accurate end-to-end.
+//
+// SSR safety: every side effect lives inside useEffect, which is a
+// no-op during server render. Server output is exactly `children`.
+// ─────────────────────────────────────────────────────────────────
+
+let _moduleInitDone = false;
+
+interface CrossdeckProviderProps extends Omit<CrossdeckOptions, "userId"> {
+  /**
+   * Optional. When defined, the provider calls Crossdeck.identify(userId)
+   * after init and on every change. When the prop flips back to undefined
+   * (logout), the provider calls Crossdeck.reset().
+   *
+   * Pass your auth library's stable user id directly:
+   *   <CrossdeckProvider userId={session?.user?.id} … />          // NextAuth
+   *   <CrossdeckProvider userId={user?.uid} … />                  // Firebase
+   *   <CrossdeckProvider userId={supabase.auth.user()?.id} … />   // Supabase
+   *
+   * Anonymous (pre-login) traffic stays anonymous until userId becomes
+   * defined — the SDK's anonymousId follows the same user record once
+   * identify lands, so attribution survives sign-up.
+   */
+  userId?: string | null | undefined;
+  children: ReactNode;
+}
+
+export function CrossdeckProvider(props: CrossdeckProviderProps): ReactNode {
+  const { userId, children, ...initOptions } = props;
+  // Track the last userId we sent to identify(), so we don't re-call
+  // identify on every render — only on actual transitions. Module-scope
+  // `_moduleInitDone` covers init de-dup; this ref covers identify.
+  const lastUserIdRef = useRef<string | null | undefined>(undefined);
+
+  // Init — once per module load, guarded against StrictMode's
+  // double-mount-in-dev so we never re-install the unload-flush
+  // listeners or reset the device-info cache.
+  useEffect(() => {
+    if (_moduleInitDone) return;
+    try {
+      Crossdeck.init(initOptions);
+      _moduleInitDone = true;
+    } catch (err) {
+      // Surface configuration errors loudly. The most common cause is
+      // a key/environment mismatch — letting it crash the provider
+      // tree would crash the whole app, which is worse than a console
+      // error during dogfood. Init failures are not recoverable
+      // mid-render, so we just log and let the rest of the app run
+      // un-initialized (every Crossdeck.* call will throw not_initialized
+      // until the operator fixes the config).
+      if (typeof console !== "undefined") {
+        console.error("[CrossdeckProvider] init failed:", err);
+      }
+    }
+    // Intentionally no deps: init runs once. Changing appId / publicKey
+    // / environment at runtime is not supported (re-mount the provider
+    // on a new key — usually unnecessary in real apps).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Identity — mirror userId prop into SDK identity. Runs after init
+  // and on every userId change. No-op when the value matches what we
+  // last sent (avoids redundant network calls on parent re-renders).
+  useEffect(() => {
+    if (!_moduleInitDone) return;
+    if (lastUserIdRef.current === userId) return;
+    lastUserIdRef.current = userId;
+    try {
+      if (userId) {
+        // identify returns a Promise but we deliberately don't await
+        // it inside the effect — the cache populates async, and
+        // useEntitlement subscribes to mutations, so the UI catches up
+        // automatically the moment the response lands. Fire-and-forget
+        // is the documented pattern.
+        void Crossdeck.identify(userId);
+      } else {
+        Crossdeck.reset();
+      }
+    } catch (err) {
+      if (typeof console !== "undefined") {
+        console.error("[CrossdeckProvider] identity sync failed:", err);
+      }
+    }
+  }, [userId]);
+
+  return children;
+}
 
 /**
  * Subscribe a React component to a single entitlement key.
