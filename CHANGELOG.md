@@ -2,6 +2,32 @@
 
 All notable changes to `@cross-deck/web` will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] — 2026-05-24
+
+Patch fix for the 1.3.0 dist-load contract. 1.3.0 introduced
+`import { version } from "../package.json"` to keep the runtime
+`Crossdeck-Sdk-Version` header in lockstep with the published bundle.
+Esbuild inlined the JSON correctly so the published bundle still
+shipped the right version on the wire, but the `dist-loading` test
+that dynamic-imports the built `.mjs` files was hitting Vitest's 5s
+default test timeout while Node evaluated the bundle.
+
+### Fixed
+
+- **Removed the runtime JSON import.** `SDK_VERSION` is now sourced
+  from a generated `src/_version.ts` file (produced by
+  `scripts/sync-sdk-versions.mjs` from `package.json`). The wire
+  contract is unchanged; the build artefact no longer carries a
+  JSON-module dependency that Node ESM requires
+  `with { type: "json" }` to load from a `.mjs` file.
+- **dist-loading test timeout bumped to 60s.** The dynamic-imports of
+  100KB+ bundles are genuinely slow on cold Node (~45s measured for
+  `vue.mjs`); the assertions themselves are sub-millisecond.
+
+1.3.0 was never published to npm; the only consumers are the public
+GitHub repo's v1.3.0 tag (left in place for traceability). 1.3.1 is
+the first 1.3.x line to reach npm.
+
 ## [1.3.0] — 2026-05-24
 
 KPMG bank-grade audit closure. Six review batches landed five SDK PRs and a backend wiring fix that closes every P0 plus 12 of 13 P1 findings. No public method renames; one internal contract change (`ErrorTracker.beforeSend` is now a getter); behavioural changes to the queue and the PII scrub that strictly improve correctness. Default-safe: existing `Crossdeck.init({...})` callsites keep working exactly the same. The wire `Crossdeck-Sdk-Version` header now reads from `package.json` so it cannot drift from the published bundle.

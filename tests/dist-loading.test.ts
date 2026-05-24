@@ -28,7 +28,18 @@ function distFile(name: string): string {
 }
 
 const distExists = fs.existsSync(distDir);
-const skip = distExists ? it : it.skip;
+// Per-test timeout for this file. Dynamic-importing the built ESM
+// bundles is slow on cold Node (Vitest measured ~45s for vue.mjs on a
+// dev laptop; CI is similar). Vitest's default 5s test timeout cuts
+// them off mid-import and the failure looks like a code bug when it's
+// actually just JIT warm-up. Bumping to 60s lets the import resolve;
+// the assertions themselves are sub-millisecond.
+const DIST_TEST_TIMEOUT_MS = 60_000;
+const skip = distExists
+  ? (name: string, fn: (...args: unknown[]) => unknown) =>
+      it(name, fn as Parameters<typeof it>[1], DIST_TEST_TIMEOUT_MS)
+  : (name: string, fn: (...args: unknown[]) => unknown) =>
+      it.skip(name, fn as Parameters<typeof it>[1]);
 
 describe("dist/ bundle loads", () => {
   skip("ESM entry is parseable + exports the core API", async () => {

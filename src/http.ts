@@ -8,18 +8,21 @@
  */
 
 import { CrossdeckError, crossdeckErrorFromResponse } from "./errors";
-// Single source of truth — version comes from package.json so a `npm
-// version` bump is the ONLY place a release-engineer touches. Every
-// downstream surface (Crossdeck-Sdk-Version header, docs, dashboard
-// snippets) reads from here at build time (SDK) or via
-// scripts/sync-sdk-versions.mjs (static docs). Pre-fix this was a
-// hardcoded literal that drifted from package.json — the published
-// 1.2.0 bundle reported `Crossdeck-Sdk-Version: @cross-deck/web@1.1.0`
-// on the wire because nobody bumped the constant.
-import { version as PACKAGE_VERSION } from "../package.json";
+// Single source of truth — `_version.ts` is generated from
+// package.json by `scripts/sync-sdk-versions.mjs`. A plain TypeScript
+// re-export here means the runtime `Crossdeck-Sdk-Version` header
+// always matches the published bundle, with zero Node-ESM JSON-import
+// gotchas (Node requires `with { type: "json" }` to load JSON as ESM
+// from a .mjs file — that bit dist-loading on 1.3.0 RC).
+//
+// Pre-fix this was a hardcoded literal that drifted from package.json:
+// the published 1.2.0 web bundle reported `@cross-deck/web@1.1.0` on
+// the wire because nobody bumped the constant. The generated
+// `_version.ts` closes that loop permanently — `--check` mode of the
+// sync script fails CI if anything goes out of sync.
+import { SDK_NAME, SDK_VERSION } from "./_version";
+export { SDK_NAME, SDK_VERSION };
 
-export const SDK_NAME = "@cross-deck/web";
-export const SDK_VERSION = PACKAGE_VERSION;
 export const DEFAULT_BASE_URL = "https://api.cross-deck.com/v1";
 
 export interface HttpClientConfig {
