@@ -36,6 +36,7 @@ import { CrossdeckError } from "./errors";
 import { HttpClient, SDK_NAME, SDK_VERSION, DEFAULT_BASE_URL } from "./http";
 import { IdentityStore } from "./identity";
 import { EntitlementCache, type EntitlementsListener } from "./entitlement-cache";
+import { deriveIdempotencyKeyForPurchase } from "./idempotency-key";
 import { EventQueue, type QueuedEvent } from "./event-queue";
 import { PersistentEventStore } from "./event-storage";
 import { CookieStorage, detectDefaultStorage, MemoryStorage } from "./storage";
@@ -134,6 +135,20 @@ export class CrossdeckClient {
       try { this.state.autoTracker?.uninstall(); } catch { /* ignore */ }
       try { this.state.webVitals?.uninstall(); } catch { /* ignore */ }
       try { this.state.errors?.uninstall(); } catch { /* ignore */ }
+      // v1.4.0 Phase 5.5 — drain the prior EventQueue's pending
+      // setTimeout BEFORE we replace this.state. Pre-fix the timer
+      // would fire AFTER the state swap, firing against new
+      // http/identity references with old-init events — a
+      // cross-identity leak risk during HMR / config swap /
+      // multi-tenant SDK shell. flush({keepalive:true}) cancels
+      // the timer (see EventQueue.cancelTimerIfSet) and ships
+      // queued events out under the prior init's identity.
+      //
+      // CRITICAL: do NOT clear the persistent event store here.
+      // The durable queue belongs to the SDK lifetime, not the
+      // init() lifetime — a survived crash mid-flush re-hydrates
+      // on the next init.
+      try { void this.state.events.flush({ keepalive: true }); } catch { /* ignore */ }
     }
     if (!options.publicKey || !options.publicKey.startsWith("cd_pub_")) {
       throw new CrossdeckError({
@@ -197,7 +212,12 @@ export class CrossdeckClient {
       // load still flushes if the user leaves quickly (the keepalive
       // pagehide handler picks up anything that doesn't); long enough
       // that bursts of clicks coalesce into one network round-trip.
-      eventFlushIntervalMs: options.eventFlushIntervalMs ?? 1500,
+      // v1.4.0 Phase 3.3 — flush interval default parity. Pre-
+      // v1.4.0: Web/Node 1500ms, RN/Swift/Android 5000ms. All
+      // converged on 2000ms (the Stripe-adjacent industry norm)
+      // so cross-platform funnels show events landing at the
+      // same cadence on every SDK. Per-instance override stays.
+      eventFlushIntervalMs: options.eventFlushIntervalMs ?? 2000,
       sdkVersion: options.sdkVersion ?? SDK_VERSION,
       autoTrack,
       appVersion: options.appVersion ?? null,
@@ -527,34 +547,23 @@ export class CrossdeckClient {
     };
     if (options?.email) body.email = options.email;
     if (traits) body.traits = traits;
+
+    // Bank-grade three-layer entitlement-cache isolation (v1.4.0
+    // Phase 1.3). Switch the cache slot BEFORE the alias POST so a
+    // mid-flight failure can't leave the cache pointing at the
+    // prior user. setUserKey:
+    //   (a) hashes the new userId into a physically separate
+    //       storage suffix — `crossdeck:entitlements:<sha256>`,
+    //   (b) unconditionally wipes the in-memory snapshot (no
+    //       conditional gating — every identify() guarantees a
+    //       fresh slot),
+    //   (c) rehydrates from the new slot so a returning user sees
+    //       their last-known-good immediately.
+    s.entitlements.setUserKey(userId);
+
     const result = await s.http.request<AliasResult>("POST", "/identity/alias", {
       body,
     });
-    // A different user identifying on this device — the prior user's
-    // durable entitlement cache must not leak to them. Clear it; the
-    // next getEntitlements() repopulates for the new identity.
-    //
-    // Pre-fix the clear was gated on `priorCdcust && new && prior !== new`.
-    // That missed two real scenarios: (1) priorCdcust was wiped by
-    // ITP / cookie eviction / partial localStorage clear but the
-    // entitlement cache survived the same wipe (different storage
-    // semantics — eg cookies and localStorage have independent TTLs);
-    // (2) the cache was rehydrated from a prior identify() that
-    // happened before persistent identity was wired up (legacy installs).
-    // In both cases a new user identifying on the device would read
-    // the previous user's entitlements until the first
-    // `getEntitlements()` round-trip completed — a P0 cross-customer
-    // leak. New contract: clear whenever the resolved cdcust differs
-    // from the in-memory snapshot OR the cache is non-empty under an
-    // unknown identity. Audit punch list P0 #5.
-    const priorCdcust = s.identity.crossdeckCustomerId;
-    const cacheHasEntries = s.entitlements.list().length > 0;
-    if (
-      (priorCdcust && result.crossdeckCustomerId && priorCdcust !== result.crossdeckCustomerId) ||
-      (!priorCdcust && cacheHasEntries)
-    ) {
-      s.entitlements.clear();
-    }
     s.identity.setCrossdeckCustomerId(result.crossdeckCustomerId);
     s.developerUserId = userId;
     return result;
@@ -1137,11 +1146,36 @@ export class CrossdeckClient {
     // order so the default sits last fixes both the explicit-undefined
     // case AND the omitted-key case in one line.
     const rail = input.rail ?? "apple";
+    const body = { ...input, rail };
+    // Phase 2.2 bank-grade contract: deterministic Idempotency-Key
+    // from the body. Same input → same key → backend short-
+    // circuits with idempotent_replay: true on retry.
+    const idempotencyKey = deriveIdempotencyKeyForPurchase(body);
     const result = await s.http.request<PurchaseResult>("POST", "/purchases/sync", {
-      body: { ...input, rail },
+      body,
+      idempotencyKey,
     });
     s.identity.setCrossdeckCustomerId(result.crossdeckCustomerId);
     s.entitlements.setFromList(result.entitlements);
+    // Phase 3.5 (v1.4.0) — emit purchase.completed so manual
+    // syncPurchases callers show up on the same funnel as the
+    // Swift/Android auto-track path. Schema mirrors the native
+    // auto-track shape so cross-platform funnels reconcile on
+    // event name + the rail/productId fields. Manual paths don't
+    // see the StoreKit Transaction so transactionId/purchaseDate
+    // are absent — funnel queries that need them stay native-
+    // auto-track only.
+    try {
+      const sourceProductId = result.entitlements[0]?.source.productId;
+      const sourceSubscriptionId = result.entitlements[0]?.source.subscriptionId;
+      const props: Record<string, unknown> = { rail };
+      if (sourceProductId) props.productId = sourceProductId;
+      if (sourceSubscriptionId) props.subscriptionId = sourceSubscriptionId;
+      if (result.idempotent_replay) props.idempotent_replay = true;
+      this.track("purchase.completed", props);
+    } catch {
+      // track() throws only on invalid name (we control it) — defensive.
+    }
     s.debug.emit(
       "sdk.purchase_evidence_sent",
       "StoreKit transaction forwarded. Waiting for backend verification.",
@@ -1226,7 +1260,11 @@ export class CrossdeckClient {
     // observers are per-page-life, not per-identity.
     this.state.autoTracker?.uninstall();
     this.state.identity.reset();
-    this.state.entitlements.clear();
+    // Logout-grade wipe: removes EVERY per-user entitlement slot on
+    // this device (layer (c) of the v1.4.0 isolation fix). A shared
+    // device can never leave another user's entitlements readable
+    // after a logout.
+    this.state.entitlements.clearAll();
     this.state.events.reset();
     // Super properties + groups are identity-scoped — clear on logout
     // so a fresh anonymous session doesn't inherit the previous user's

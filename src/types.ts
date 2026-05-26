@@ -51,6 +51,10 @@ export interface PurchaseResult {
   crossdeckCustomerId: string;
   env: Environment;
   entitlements: PublicEntitlement[];
+  /** True when the response came from the backend's idempotency
+   * cache instead of fresh processing. Backend also returns
+   * `Idempotent-Replayed: true` as a response header (v1.4.0). */
+  idempotent_replay?: boolean;
 }
 
 export interface HeartbeatResponse {

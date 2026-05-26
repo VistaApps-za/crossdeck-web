@@ -36,10 +36,9 @@ const distExists = fs.existsSync(distDir);
 // the assertions themselves are sub-millisecond.
 const DIST_TEST_TIMEOUT_MS = 60_000;
 const skip = distExists
-  ? (name: string, fn: (...args: unknown[]) => unknown) =>
-      it(name, fn as Parameters<typeof it>[1], DIST_TEST_TIMEOUT_MS)
-  : (name: string, fn: (...args: unknown[]) => unknown) =>
-      it.skip(name, fn as Parameters<typeof it>[1]);
+  ? (name: string, fn: () => void | Promise<void>) =>
+      it(name, { timeout: DIST_TEST_TIMEOUT_MS }, fn)
+  : (name: string, fn: () => void | Promise<void>) => it.skip(name, fn);
 
 describe("dist/ bundle loads", () => {
   skip("ESM entry is parseable + exports the core API", async () => {

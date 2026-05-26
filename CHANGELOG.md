@@ -2,7 +2,23 @@
 
 All notable changes to `@cross-deck/web` will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.3.1] — 2026-05-24
+## [1.4.0] — 2026-05-26
+
+**Bank-grade reconciliation release.** 6-pillar KPMG-style audit closed across SDK + backend. Every behavioural guarantee registered in the monorepo's `contracts/` directory with a CI-enforced audit job — drift is now a PR-time error.
+
+### Added
+
+- **Deterministic `Idempotency-Key` on `syncPurchases()`.** Derived from the request body (SHA-256 of `crossdeck:purchases/sync:<rail>:<jws>`, formatted as UUID). Same purchase → same key → backend short-circuits with `idempotent_replay: true`. Cross-SDK parity oracle CI-pinned: every SDK produces `a66b1640-efaf-bb4d-1261-6650033bf111` for the canonical test vector.
+- **Per-user entitlement cache isolation.** Storage key is now `crossdeck:entitlements:<sha256(userId)>` — a user-switch on a shared device cannot physically read prior user's cached entitlements even if the in-memory clear is somehow skipped. `reset()` wipes EVERY per-user slot via the persisted index. New pure-JS SHA-256 helper (no SubtleCrypto async cascade through hot-path reads).
+- **`PurchaseResult.idempotent_replay?: boolean`** — true when the response came from the backend's idempotency cache instead of fresh processing.
+- **`purchase.completed` event on every successful `syncPurchases()`** — schema matches the auto-track event so cross-platform funnels reconcile.
+- **15 backend-emitted error codes** added to `crossdeck-error-codes.json` catalogue (`invalid_api_key`, `origin_not_allowed`, `bundle_id_not_allowed`, `package_name_not_allowed`, `env_mismatch`, `idempotency_key_in_use`, `rate_limited`, `internal_error`, `google_not_supported`, `stripe_not_supported`, etc.) — `getErrorCode()` now returns Stripe-style remediation for every wire code instead of `undefined`.
+
+### Changed
+
+- **`init()` re-entry now drains the prior `EventQueue`'s pending timer** before swapping `this.state`. Pre-1.4.0 the timer fired AFTER the state swap, sending old-init events under new-init identity — cross-identity leak during HMR / config swap / multi-tenant SDK shells.
+- **Default event-queue flush interval is now 2000ms** (was 1500ms) — parity with every other Crossdeck SDK on the Stripe-adjacent industry norm.
+- **`reset()` now wipes every per-user entitlement slot on the device** via the persisted index, not just the active user's slot.
 
 Patch fix for the 1.3.0 dist-load contract. 1.3.0 introduced
 `import { version } from "../package.json"` to keep the runtime

@@ -48,6 +48,7 @@
  *     work from boot thanks to hydration above.
  */
 
+import { sha256Hex } from "./hash";
 import type { KeyValueStorage, PublicEntitlement } from "./types";
 
 export type EntitlementsListener = (entitlements: PublicEntitlement[]) => void;
@@ -62,6 +63,16 @@ interface PersistedCache {
 /** Default staleness window — data older than this is flagged even with no failed refresh. */
 const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1000; // 24h
 
+/** Anonymous suffix used before identify() has been called. Stable
+ * across launches so an anonymous session's cache survives a reload
+ * — but physically separate from any identified user's cache. */
+const ANON_SUFFIX = "_anon";
+
+/** Suffix for the index entry that tracks every per-user key we've
+ * written. Used by clearAll() to scope a logout-wipe to ONLY
+ * Crossdeck keys, never the host app's own localStorage. */
+const INDEX_SUFFIX = "_index";
+
 export class EntitlementCache {
   private all: PublicEntitlement[] = [];
   private lastUpdated = 0;
@@ -69,27 +80,90 @@ export class EntitlementCache {
   private listeners = new Set<EntitlementsListener>();
   private listenerErrorCount = 0;
   private readonly storage?: KeyValueStorage;
-  private readonly storageKey: string;
+  private readonly storageKeyPrefix: string;
   private readonly staleAfterMs: number;
+  private currentSuffix: string = ANON_SUFFIX;
 
   /**
-   * @param storage      Device storage adapter. When omitted (tests) or
-   *                     a MemoryStorage (strict-consent / no-persistence
-   *                     mode) the cache is session-only — durability is
-   *                     simply absent, never wrong.
-   * @param storageKey   Full key the persisted blob lives under.
-   * @param staleAfterMs Age past which last-known-good is flagged stale
-   *                     even without a failed refresh. Default 24h.
+   * @param storage          Device storage adapter. When omitted (tests) or
+   *                         a MemoryStorage (strict-consent / no-persistence
+   *                         mode) the cache is session-only — durability is
+   *                         simply absent, never wrong.
+   * @param storageKeyPrefix Prefix used to derive per-user storage keys
+   *                         (`<prefix>:<sha256(userId)>`). Default
+   *                         `crossdeck:entitlements`. The trailing user
+   *                         suffix is filled at identify() / reset()
+   *                         time — see [[setUserKey]].
+   * @param staleAfterMs     Age past which last-known-good is flagged stale
+   *                         even without a failed refresh. Default 24h.
    */
   constructor(
     storage?: KeyValueStorage,
-    storageKey = "crossdeck:entitlements",
+    storageKeyPrefix = "crossdeck:entitlements",
     staleAfterMs = DEFAULT_STALE_AFTER_MS,
   ) {
     this.storage = storage;
-    this.storageKey = storageKey;
+    this.storageKeyPrefix = storageKeyPrefix;
     this.staleAfterMs = staleAfterMs;
     this.hydrate();
+  }
+
+  /** The full storage key the current-user blob is persisted under. */
+  private get storageKey(): string {
+    return `${this.storageKeyPrefix}:${this.currentSuffix}`;
+  }
+
+  /** Key of the index blob — a JSON array of every suffix we've
+   * written. Used by clearAll() to scope a logout-wipe. */
+  private get indexKey(): string {
+    return `${this.storageKeyPrefix}:${INDEX_SUFFIX}`;
+  }
+
+  /** Derive a stable suffix for a developerUserId via SHA-256. The
+   * raw userId never lands in the storage key — protects against
+   * accidentally leaking email-style identifiers through DevTools
+   * inspection. Pass `null` to switch back to the anonymous slot. */
+  static suffixForUserId(userId: string | null): string {
+    if (userId == null || userId === "") return ANON_SUFFIX;
+    return sha256Hex(userId);
+  }
+
+  /**
+   * Switch the cache to a different user's storage slot. Bank-grade
+   * three-layer isolation:
+   *   (a) Physical key separation — `<prefix>:<sha256(userId)>` so
+   *       a user-switch can't physically read prior user's data
+   *       even if the in-memory clear was skipped.
+   *   (b) Unconditional in-memory clear — invoked whenever the
+   *       active suffix changes, even on same-id re-identify.
+   *   (c) Re-hydrate from the new slot — a returning user observes
+   *       their last-known-good cache from storage immediately.
+   *
+   * Caller (identify() / reset()) MUST invoke this BEFORE the next
+   * setFromList() so the write lands under the right key.
+   */
+  setUserKey(userId: string | null): void {
+    const nextSuffix = EntitlementCache.suffixForUserId(userId);
+    if (nextSuffix === this.currentSuffix) {
+      // Same user (or repeated anonymous) — still unconditionally
+      // wipe in-memory cache to satisfy the founder's "unconditional
+      // clear on identify" contract.
+      this.all = [];
+      this.lastUpdated = 0;
+      this.lastRefreshFailedAt = 0;
+      this.notify();
+      // Re-hydrate from the same slot so a fresh boot's
+      // last-known-good is honoured.
+      this.hydrate();
+      return;
+    }
+    this.currentSuffix = nextSuffix;
+    // New slot: wipe in-memory + rehydrate from new slot.
+    this.all = [];
+    this.lastUpdated = 0;
+    this.lastRefreshFailedAt = 0;
+    this.hydrate();
+    this.notify();
   }
 
   /**
@@ -174,13 +248,14 @@ export class EntitlementCache {
     this.lastUpdated = Date.now();
     this.lastRefreshFailedAt = 0;
     this.persist();
+    this.recordSuffixInIndex(this.currentSuffix);
     this.notify();
   }
 
   /**
-   * Wipe — used on reset() (logout) and on an identity switch. Clears
-   * BOTH memory and durable storage so a prior user's entitlements can
-   * never leak to the next person on this device.
+   * Wipe the CURRENT user's slot. Used internally when a single
+   * user's cache needs to be invalidated without affecting other
+   * persisted slots. The full-logout path is [[clearAll]].
    */
   clear(): void {
     this.all = [];
@@ -191,6 +266,46 @@ export class EntitlementCache {
         this.storage.removeItem(this.storageKey);
       } catch {
         // Private mode / quota — best-effort, same posture as storage.ts.
+      }
+    }
+    this.removeSuffixFromIndex(this.currentSuffix);
+    this.notify();
+  }
+
+  /**
+   * Logout-grade wipe — bank-grade contract: removes EVERY per-user
+   * entitlement slot the SDK has ever written on this device, then
+   * clears the index. Used by `Crossdeck.reset()` so a logout on a
+   * shared device can never leave another user's entitlements
+   * readable (layer (c) of the v1.4.0 isolation fix).
+   *
+   * After clearAll(), the cache is back to anonymous + empty.
+   */
+  clearAll(): void {
+    this.all = [];
+    this.lastUpdated = 0;
+    this.lastRefreshFailedAt = 0;
+    this.currentSuffix = ANON_SUFFIX;
+    if (this.storage) {
+      const suffixes = this.readIndex();
+      for (const suffix of suffixes) {
+        try {
+          this.storage.removeItem(`${this.storageKeyPrefix}:${suffix}`);
+        } catch {
+          // best-effort
+        }
+      }
+      // Also remove the anonymous slot explicitly — it may not have
+      // been indexed if the cache was wiped before its first write.
+      try {
+        this.storage.removeItem(`${this.storageKeyPrefix}:${ANON_SUFFIX}`);
+      } catch {
+        // best-effort
+      }
+      try {
+        this.storage.removeItem(this.indexKey);
+      } catch {
+        // best-effort
       }
     }
     this.notify();
@@ -248,6 +363,52 @@ export class EntitlementCache {
     } catch {
       // Quota exceeded / private mode — the in-memory cache still works
       // for this session; we just lose cross-reload durability.
+    }
+  }
+
+  /** Read the index of all per-user suffixes the SDK has written. */
+  private readIndex(): string[] {
+    if (!this.storage) return [];
+    try {
+      const raw = this.storage.getItem(this.indexKey);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter((x): x is string => typeof x === "string");
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Add a suffix to the persisted index. Idempotent. */
+  private recordSuffixInIndex(suffix: string): void {
+    if (!this.storage) return;
+    const existing = this.readIndex();
+    if (existing.includes(suffix)) return;
+    existing.push(suffix);
+    try {
+      this.storage.setItem(this.indexKey, JSON.stringify(existing));
+    } catch {
+      // best-effort
+    }
+  }
+
+  /** Remove a suffix from the persisted index. No-op if absent. */
+  private removeSuffixFromIndex(suffix: string): void {
+    if (!this.storage) return;
+    const existing = this.readIndex();
+    const next = existing.filter((s) => s !== suffix);
+    if (next.length === existing.length) return;
+    try {
+      if (next.length === 0) {
+        this.storage.removeItem(this.indexKey);
+      } else {
+        this.storage.setItem(this.indexKey, JSON.stringify(next));
+      }
+    } catch {
+      // best-effort
     }
   }
 

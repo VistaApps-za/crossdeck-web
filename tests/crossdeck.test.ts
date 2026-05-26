@@ -239,7 +239,9 @@ describe("identify", () => {
     // Pre-populate the entitlement cache WITHOUT a cdcust (simulating
     // the partial wipe — entitlements survived, identity didn't).
     storage.setItem(
-      "crossdeck:entitlements",
+      // v1.4.0 keying: anonymous slot is `:_anon`; identified slots
+      // live under `:<sha256(userId)>` (see entitlement-cache.ts).
+      "crossdeck:entitlements:_anon",
       JSON.stringify({
         v: 1,
         entitlements: [

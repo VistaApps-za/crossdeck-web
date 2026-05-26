@@ -163,6 +163,18 @@ Link the anonymous device to a developer-supplied user ID. Persists the resolved
 
 If `mergePending: true`, both identifiers already pointed at different customers. Crossdeck **never silently merges** — your dashboard's operations queue surfaces the merge for human confirmation.
 
+**Entitlement-cache isolation (v1.4.0).** Every `identify(userId)` switches the local entitlement cache to a per-user storage slot — `localStorage["crossdeck:entitlements:<sha256(userId)>"]` — and unconditionally wipes the in-memory snapshot. A user-switch on a shared device CANNOT cross-read a prior user's cached entitlements, even if the in-memory clear is somehow skipped, because the storage keys are physically separate. `reset()` then wipes every per-user slot on the device (logout-grade).
+
+**Idempotency-Key (v1.4.0).** Every `syncPurchases()` derives a
+deterministic `Idempotency-Key` from the request body — same
+signed transaction in produces the same key out. The backend
+short-circuits repeats with `idempotent_replay: true` in the
+response, so a network blip / app crash mid-flight that re-fires
+the same purchase doesn't double-process. The key is a UUID-shaped
+SHA-256 digest of `crossdeck:purchases/sync:<rail>:<jws|token>`,
+so two SDKs reporting the same Apple transaction land on the same
+key.
+
 ### `await Crossdeck.getEntitlements()`
 
 Fetch the current customer's active entitlements. Returns an array of `PublicEntitlement` and updates the local cache.
@@ -215,7 +227,7 @@ Manually send a heartbeat. Called automatically by `init()` unless `autoHeartbea
 
 ### `Crossdeck.reset()`
 
-Wipe persisted identity + entitlement cache + queued events. Call on logout. The next session generates a fresh `anonymousId` and starts a clean identity-graph entry.
+Wipe persisted identity + EVERY per-user entitlement cache slot on this device + queued events. Call on logout. The next session generates a fresh `anonymousId` and starts a clean identity-graph entry. The per-user scope of the cache wipe (introduced v1.4.0) means a shared-device logout cannot leave a separate user's entitlements readable from `localStorage`.
 
 ### `Crossdeck.flush()`
 

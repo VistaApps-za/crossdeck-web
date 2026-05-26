@@ -56,12 +56,38 @@ const distDir = path.resolve(new URL(".", import.meta.url).pathname, "../dist");
 // the bundles; still under every single-pillar competitor's ceiling.
 // core ESM 33 → 35 KB, core CJS 34 → 36 KB, react / vue ESM 33 → 35
 // KB, UMD 18 → 19 KB.
+//
+// Budgets raised again v1.4.0 (May 2026) — Phase 1.3 of bank-grade
+// reconciliation: the per-user entitlement-cache isolation needs a
+// sync SHA-256 over developerUserId so storage keys are physically
+// separated per user (`crossdeck:entitlements:<sha256>`). Pure-JS
+// SHA-256 (~80 LOC + K constants) adds ~2 KB gzipped — the explicit
+// tradeoff for keeping setFromList/clear/hydrate sync (no
+// SubtleCrypto async cascade through identify()/getEntitlements()/
+// useEntitlement) AND working on RN/Hermes without a polyfill dep.
+// Still well under every single-pillar competitor's ceiling.
+// core ESM 35 → 38 KB, core CJS 36 → 39 KB, react / vue ESM 35 → 38
+// KB, UMD 19 → 21 KB.
+//
+// Budgets nudged again v1.4.0 (May 2026) — Phase 2.2.a + 3.5 added
+// idempotency-key derivation (~0.4 KB) + purchase.completed funnel
+// emission (~0.1 KB) on the syncPurchases path. Cumulative pushed
+// core ESM to ~38.05 KB; raise to 39 KB across the ESM bundles to
+// stay one safety-margin KB above current size.
+//
+// Budgets nudged again v1.4.0 (May 2026) — Phase 6.2 SDK error-
+// codes catalogue backfill added 15 backend-emitted code entries
+// per SDK (description + resolution + retryable flag each) so
+// getErrorCode() returns Stripe-style remediation for every wire
+// code instead of `undefined`. ~1 KB gzipped. Raise core ESM
+// 39 → 41, core CJS 40 → 42, react/vue ESM 39 → 41, UMD 21 → 23.
+// Still well below every single-pillar competitor's ceiling.
 const BUDGETS = [
-  { file: "index.mjs", maxGzipKb: 35, label: "core ESM" },
-  { file: "index.cjs", maxGzipKb: 36, label: "core CJS" },
-  { file: "react.mjs", maxGzipKb: 35, label: "react ESM" },
-  { file: "vue.mjs", maxGzipKb: 35, label: "vue ESM" },
-  { file: "crossdeck.umd.min.js", maxGzipKb: 19, label: "UMD min" },
+  { file: "index.mjs", maxGzipKb: 41, label: "core ESM" },
+  { file: "index.cjs", maxGzipKb: 42, label: "core CJS" },
+  { file: "react.mjs", maxGzipKb: 41, label: "react ESM" },
+  { file: "vue.mjs", maxGzipKb: 41, label: "vue ESM" },
+  { file: "crossdeck.umd.min.js", maxGzipKb: 23, label: "UMD min" },
 ];
 
 let failed = false;
