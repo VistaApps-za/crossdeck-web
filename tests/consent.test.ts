@@ -33,48 +33,54 @@ describe("ConsentManager — set()", () => {
 });
 
 describe("ConsentManager — DNT", () => {
-  it("does NOT apply DNT when respectDnt is off (default)", () => {
-    const origNav = (globalThis as { navigator?: Navigator }).navigator;
-    (globalThis as unknown as { navigator: unknown }).navigator = {
-      doNotTrack: "1",
-    } as unknown as Navigator;
+  // Node 24+ made globalThis.navigator a read-only getter; the
+  // plain assignment pattern `globalThis.navigator = ...` throws
+  // `TypeError: Cannot set property navigator of #<Object>
+  // which has only a getter`. Use Object.defineProperty to install
+  // a new descriptor that overrides the getter. Pattern works on
+  // Node 20 (monorepo CI), Node 22, and Node 24 (npm publish CI).
+  function withNavigator<T>(fake: { doNotTrack: string | null | undefined }, body: () => T): T {
+    const desc = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    Object.defineProperty(globalThis, "navigator", {
+      value: fake,
+      writable: true,
+      configurable: true,
+    });
     try {
+      return body();
+    } finally {
+      if (desc) {
+        Object.defineProperty(globalThis, "navigator", desc);
+      } else {
+        delete (globalThis as { navigator?: Navigator }).navigator;
+      }
+    }
+  }
+
+  it("does NOT apply DNT when respectDnt is off (default)", () => {
+    withNavigator({ doNotTrack: "1" }, () => {
       const c = new ConsentManager();
       expect(c.isDntDenied).toBe(false);
       expect(c.analytics).toBe(true);
-    } finally {
-      (globalThis as { navigator?: Navigator }).navigator = origNav;
-    }
+    });
   });
 
   it("applies DNT when respectDnt: true and navigator.doNotTrack === '1'", () => {
-    const origNav = (globalThis as { navigator?: Navigator }).navigator;
-    (globalThis as unknown as { navigator: unknown }).navigator = {
-      doNotTrack: "1",
-    } as unknown as Navigator;
-    try {
+    withNavigator({ doNotTrack: "1" }, () => {
       const c = new ConsentManager({ respectDnt: true });
       expect(c.isDntDenied).toBe(true);
       expect(c.analytics).toBe(false);
       expect(c.marketing).toBe(false);
       expect(c.errors).toBe(false);
-    } finally {
-      (globalThis as { navigator?: Navigator }).navigator = origNav;
-    }
+    });
   });
 
   it("DNT-derived denies cannot be flipped back on", () => {
-    const origNav = (globalThis as { navigator?: Navigator }).navigator;
-    (globalThis as unknown as { navigator: unknown }).navigator = {
-      doNotTrack: "1",
-    } as unknown as Navigator;
-    try {
+    withNavigator({ doNotTrack: "1" }, () => {
       const c = new ConsentManager({ respectDnt: true });
       c.set({ analytics: true });
       expect(c.analytics).toBe(false);
-    } finally {
-      (globalThis as { navigator?: Navigator }).navigator = origNav;
-    }
+    });
   });
 });
 

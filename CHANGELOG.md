@@ -2,6 +2,19 @@
 
 All notable changes to `@cross-deck/web` will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] — 2026-05-26
+
+Patch — Node 24 compatibility fix for the npm publish pipeline. The
+`consent.test.ts` DNT cases mutated `globalThis.navigator` via direct
+assignment; Node 24 (the public crossdeck-web repo's npm publish
+workflow Node version) made navigator a read-only getter, so the
+test threw `TypeError: Cannot set property navigator` and aborted
+the publish. Pattern switched to `Object.defineProperty`. v1.4.0
+was tagged on the public GitHub repo but never reached npm — v1.4.1
+is the first 1.4.x line to land on the npm registry. **No SDK code
+changes vs v1.4.0**; the entire bank-grade reconciliation surface
+documented below ships unchanged.
+
 ## [1.4.0] — 2026-05-26
 
 **Bank-grade reconciliation release.** 6-pillar KPMG-style audit closed across SDK + backend. Every behavioural guarantee registered in the monorepo's `contracts/` directory with a CI-enforced audit job — drift is now a PR-time error.
