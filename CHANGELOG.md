@@ -2,6 +2,80 @@
 
 All notable changes to `@cross-deck/web` will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] — 2026-05-27
+
+`crossdeck.contract_failed` is now single-fire to a dedicated
+reliability endpoint instead of the customer's `track()` pipeline.
+Independent-controller flow per Privacy Policy §6; schema-locked by
+`contracts/diagnostics/contract-failed-payload-schema-lock.json`.
+`ContractFailureInput.extra` removed (schema-lock forbids unbounded
+fields); `ContractFailureInput.deviceClass` added.
+
+**Runtime contract verifier layer.** The SDK now self-tests its
+own structural contracts at runtime — per-user cache isolation,
+idempotency-key determinism, error-envelope shape, flush-interval
+parity, super-property merge precedence. Verifiers run on every
+relevant SDK operation; PASS results stream to the developer's
+console when `logVerifierResults: true`; FAIL results fire
+`reportContractFailure(...)` to the reliability channel.
+
+Three new `CrossdeckOptions` flags:
+  - `verifyContractsAtBoot` — default dev=true, prod=false
+  - `logVerifierResults` — default dev=true, prod=false (cosmetic only)
+  - `disableContractAssertions` — sovereignty kill-switch, default false
+
+Bundle-size budget bumped 45 → 55 KB gzipped (core) and 26 → 32 KB
+(UMD) to accommodate the ~6 KB verifier framework + verifier
+implementations. The platform-hardening signal — every install
+in the field tests its own structural contracts as it operates and
+reports failures to Crossdeck's reliability workspace in real time —
+is the trade-off.
+
+## [1.5.0] — 2026-05-26
+
+Minor — `CrossdeckContracts` + `reportContractFailure(...)` ship as a
+new public surface on every SDK simultaneously. Additive only; no
+behavioural change to existing APIs.
+
+**Added:**
+
+- **`CrossdeckContracts` namespace** — typed, tree-shakeable access to
+  the bank-grade contract registry the SDK was already shipping in
+  `dist/contracts.json`. Methods: `all()` (enforced only),
+  `allIncludingHistorical()`, `byId(id)`, `byPillar(pillar)`,
+  `withStatus(status)`, `findByTestName(name)`. Properties:
+  `sdkVersion`, `bundledIn` (e.g. `"@cross-deck/web@1.5.0"`).
+- **`Contract` type + `ContractPillar` / `ContractStatus` /
+  `ContractAppliesTo` unions + `ContractTestRef` interface** exported
+  from the top-level entry. Treated as binary-stable — fields may be
+  added in any minor release but never removed/repurposed except in a
+  major bump.
+- **`Crossdeck.reportContractFailure(input)` method** — fires a
+  typed `crossdeck.contract_failed` custom event through the
+  standard `track()` pipeline when a contract test asserts and
+  fails (in CI, dogfood, or a customer integration test). Wire
+  properties: `contract_id`, `sdk_version` (auto-stamped),
+  `sdk_platform` (auto-stamped to `"web"`), `failure_reason`,
+  `run_context` (`ci` | `dogfood` | `customer-app`), `run_id`, and
+  optional `test_file` / `test_name` from `input.testRef`.
+- **Bundle size**: core ESM/CJS/react/vue budgets raised to 45 KB
+  gzipped (from 41 KB), UMD min to 26 KB (from 23 KB) to accommodate
+  the inlined contracts dataset (~3 KB gzipped) + the query helpers
+  + the new public types. Still well below every single-pillar
+  competitor's ceiling (Mixpanel 55, Sentry 30 errors-only, PostHog
+  40 analytics-only) for a one-bundle three-pillar SDK that now
+  also ships its own verification dataset.
+
+**Changed:**
+
+- Contract registry source files migrated from snake_case to camelCase
+  keys (`appliesTo`, `codeRef`, `testRef`, `registeredAt`,
+  `firstRegisteredIn`). The bundled `contracts.json` sidecar shipped
+  with this release uses the new keys. `bundledIn` is added at build
+  time, never present in source. See [`contracts/README.md`](https://github.com/VistaApps-za/crossdeck/blob/main/contracts/README.md)
+  for the schema rationale and `firstRegisteredIn` (immutable) vs
+  `bundledIn` (build-stamped) split.
+
 ## [1.4.2] — 2026-05-26
 
 Patch — second npm publish pipeline fix. v1.4.1 fixed the Node 24

@@ -49,6 +49,20 @@ import { SuperPropertyStore } from "./super-properties";
 import { WebVitalsTracker } from "./web-vitals";
 import { ConsentManager, scrubPii, scrubPiiFromProperties, type ConsentState } from "./consent";
 import { BreadcrumbBuffer, type Breadcrumb } from "./breadcrumbs";
+import type { ContractFailureInput } from "./contracts";
+import { sendDiagnosticTelemetry } from "./_diagnostic-telemetry";
+import {
+  STATIC_VERIFIERS,
+  VerifierReporter,
+  buildVerifierContext,
+  buildFlushIntervalVerifier,
+  defaultDebugModeFlag,
+  runBootSelfTest,
+  runOnIdentify,
+  runOnSyncPurchases,
+  type ContractVerifier,
+  type VerifierContext,
+} from "./_contract-verifiers";
 import {
   DEFAULT_ERROR_CAPTURE,
   ErrorTracker,
@@ -92,7 +106,20 @@ interface InternalState {
   options: Required<
     Omit<
       CrossdeckOptions,
-      "storage" | "sdkVersion" | "autoTrack" | "appVersion" | "debug" | "respectDnt" | "scrubPii"
+      | "storage"
+      | "sdkVersion"
+      | "autoTrack"
+      | "appVersion"
+      | "debug"
+      | "respectDnt"
+      | "scrubPii"
+      // The three contract-verifier flags are resolved + consumed
+      // outside state.options (see CrossdeckClient.verifierCtx /
+      // verifierReporter / verifiers fields). They don't need to
+      // round-trip through the InternalState options struct.
+      | "verifyContractsAtBoot"
+      | "logVerifierResults"
+      | "disableContractAssertions"
     >
   > & {
     sdkVersion: string;
@@ -111,6 +138,23 @@ interface InternalState {
 
 export class CrossdeckClient {
   private state: InternalState | null = null;
+
+  // ────────────────────────────────────────────────────────────────
+  // Contract verifier layer (see sdks/web/src/_contract-verifiers.ts).
+  //
+  // Three flags govern this layer (CrossdeckOptions):
+  //   verifyContractsAtBoot     — boot self-test on Crossdeck.start
+  //   logVerifierResults        — print PASS results to console
+  //   disableContractAssertions — total kill-switch
+  //
+  // When the kill-switch is set, all three fields stay null and
+  // every hot-path dispatcher short-circuits — zero runtime cost.
+  // Otherwise: populated once at init(), referenced from every
+  // hot-path call site (identify, syncPurchases, ...).
+  // ────────────────────────────────────────────────────────────────
+  private verifiers: readonly ContractVerifier[] | null = null;
+  private verifierReporter: VerifierReporter | null = null;
+  private verifierCtx: VerifierContext | null = null;
 
   /**
    * Boot the SDK. Idempotent — calling init twice with the same options
@@ -464,6 +508,173 @@ export class CrossdeckClient {
       // Skipped in dev mode — there's nothing to heartbeat.
       void this.heartbeat().catch(() => undefined);
     }
+
+    // ────────────────────────────────────────────────────────────────
+    // Contract verifier layer — install LAST so the SDK is fully
+    // constructed before any verifier observes its state. See
+    // sdks/web/src/_contract-verifiers.ts for the full architecture.
+    //
+    // Three-layer precedence (locked):
+    //
+    //   code option > dashboard remote config > DEBUG/RELEASE default
+    //
+    // Code wins so engineers retain ultimate control; the dashboard
+    // toggle (per-app, via /dashboard/apps/{appId}) is the no-deploy
+    // operational lever for QA / staging soaks; default is what ships
+    // when nobody touches anything.
+    //
+    // Routing rules — locked here so a future change to init() can't
+    // accidentally muddle them (the docstrings on the CrossdeckOptions
+    // fields name each other as the wrong tool for the wrong job):
+    //
+    //   disableContractAssertions: true  → layer is entirely silent
+    //   logVerifierResults:        false → console silent on PASS;
+    //                                       FAIL still prints at WARN
+    //   verifyContractsAtBoot:     false → no boot self-test, but
+    //                                       hot-path verifiers still run
+    //
+    // `disableContractAssertions` is intentionally NOT remote-
+    // configurable — sovereignty kill-switch must live in customer
+    // source so procurement / audit teams can grep for it.
+    // ────────────────────────────────────────────────────────────────
+    if (options.disableContractAssertions !== true) {
+      const debugDefault = defaultDebugModeFlag();
+      // 1. SYNCHRONOUS BOOTSTRAP — context + reporter + verifier set
+      //    are constructed immediately using code > default. Hot-path
+      //    verifiers fire correctly from the next operation onwards.
+      this.verifierCtx = buildVerifierContext({
+        logVerifierResults: options.logVerifierResults ?? debugDefault,
+        disableContractAssertions: false,
+        // Best-effort run-context detection. Customers running the
+        // Web SDK inside their own CI (Playwright, Cypress, etc.)
+        // typically set CI=true; we use that as the signal. Otherwise
+        // we assume `customer-app` — the SDK is running inside a
+        // customer's deployed site.
+        runContext: typeof process !== "undefined" && process.env && process.env.CI
+          ? "ci"
+          : "customer-app",
+      });
+      this.verifierReporter = new VerifierReporter(this.verifierCtx);
+      const flushVerifier = buildFlushIntervalVerifier(opts.eventFlushIntervalMs);
+      this.verifiers = Object.freeze([...STATIC_VERIFIERS, flushVerifier]);
+
+      // 2. ASYNCHRONOUS REFINEMENT — fetch /v1/config and apply the
+      //    dashboard's per-app remote config, then fire the boot
+      //    self-test (so its output reflects the FINAL resolved
+      //    flags, not the pre-fetch defaults). Fire-and-forget — a
+      //    fetch failure leaves the local defaults in place and the
+      //    boot self-test runs only if code > default resolves true.
+      //
+      //    Skipped in localDevMode (test harness / offline emulator
+      //    where there's no backend to fetch from). Boot self-test
+      //    still fires under code > default precedence directly.
+      if (localDevMode) {
+        const verifyAtBootLocal =
+          options.verifyContractsAtBoot ?? debugDefault;
+        if (verifyAtBootLocal && this.verifierReporter) {
+          void runBootSelfTest(
+            this.verifiers,
+            this.verifierReporter,
+            this.verifierCtx,
+          ).catch(() => undefined);
+        }
+      } else {
+        void this.bootstrapVerifierLayerRemote(options, debugDefault).catch(
+          () => undefined,
+        );
+      }
+    }
+    // The previous synchronous boot-test block is now replaced by the
+    // async refinement above. Closing brace below remains the end of
+    // init().
+    return;
+  }
+
+  /**
+   * Fetch /v1/config from the backend and apply any per-app verifier
+   * overrides set in the dashboard, then fire the boot self-test
+   * once with the FINAL resolved flags.
+   *
+   * Precedence (also documented at the call site in init()):
+   *   code option > dashboard remote config > DEBUG/RELEASE default
+   *
+   * Code wins so engineers retain ultimate control; dashboard is the
+   * no-deploy operational lever for QA / staging soaks.
+   *
+   * Never throws — a /v1/config failure surfaces as "stick with the
+   * synchronous defaults that init() already applied" and the boot
+   * self-test runs only if code > default resolves true.
+   */
+  private async bootstrapVerifierLayerRemote(
+    options: CrossdeckOptions,
+    debugDefault: boolean,
+  ): Promise<void> {
+    if (!this.state || !this.verifiers || !this.verifierCtx) return;
+
+    interface RemoteVerifierConfig {
+      logVerifierResults: boolean | null;
+      verifyContractsAtBoot: boolean | null;
+    }
+    interface ConfigResponseShape {
+      verifierConfig?: RemoteVerifierConfig;
+    }
+
+    let remote: RemoteVerifierConfig = {
+      logVerifierResults: null,
+      verifyContractsAtBoot: null,
+    };
+    try {
+      const resp = await this.state.http.request<ConfigResponseShape>(
+        "GET",
+        "/config",
+      );
+      if (resp && resp.verifierConfig) {
+        const r = resp.verifierConfig;
+        remote = {
+          logVerifierResults:
+            typeof r.logVerifierResults === "boolean"
+              ? r.logVerifierResults
+              : null,
+          verifyContractsAtBoot:
+            typeof r.verifyContractsAtBoot === "boolean"
+              ? r.verifyContractsAtBoot
+              : null,
+        };
+      }
+    } catch {
+      // Fall through — `remote` stays null, defaults apply.
+    }
+
+    // Resolve precedence: code > remote > default.
+    const logResults =
+      options.logVerifierResults ??
+      (remote.logVerifierResults ?? debugDefault);
+    const verifyAtBoot =
+      options.verifyContractsAtBoot ??
+      (remote.verifyContractsAtBoot ?? debugDefault);
+
+    // If the remote config or precedence changed the resolved value
+    // from what the synchronous bootstrap chose, rebuild the
+    // context + reporter so subsequent hot-path verifiers see the
+    // updated flags. The previous reporter is GC'd; in-flight hot-
+    // path dispatches that snapshot the reporter (none currently;
+    // every dispatcher reads `this.verifierReporter` at call time)
+    // would see the old flags.
+    if (logResults !== this.verifierCtx.logVerifierResults) {
+      this.verifierCtx = {
+        ...this.verifierCtx,
+        logVerifierResults: logResults,
+      };
+      this.verifierReporter = new VerifierReporter(this.verifierCtx);
+    }
+
+    if (verifyAtBoot && this.verifierReporter) {
+      await runBootSelfTest(
+        this.verifiers,
+        this.verifierReporter,
+        this.verifierCtx,
+      );
+    }
   }
 
   /**
@@ -559,7 +770,29 @@ export class CrossdeckClient {
     //       fresh slot),
     //   (c) rehydrates from the new slot so a returning user sees
     //       their last-known-good immediately.
+    // Capture prior userId BEFORE the slot rotation so the
+    // per-user-cache-isolation verifier can observe the transition.
+    // Reading this from `s.developerUserId` (the prior state) — the
+    // assignment to the new value happens further down, after the
+    // HTTP call.
+    const priorUserId = s.developerUserId;
+
     s.entitlements.setUserKey(userId);
+
+    // ────────────────────────────────────────────────────────────
+    // Hot-path verifier: per-user-cache-isolation runs AFTER the
+    // slot rotation completes. PASS prints to debug console if
+    // `logVerifierResults: true`; FAIL prints at WARN + fires
+    // `reportContractFailure(...)` to the reliability channel.
+    // Short-circuits cheaply when `disableContractAssertions: true`.
+    // ────────────────────────────────────────────────────────────
+    if (this.verifiers && this.verifierReporter && this.verifierCtx) {
+      runOnIdentify(this.verifiers, this.verifierReporter, this.verifierCtx, {
+        priorUserId,
+        nextUserId: userId,
+        cache: s.entitlements,
+      });
+    }
 
     const result = await s.http.request<AliasResult>("POST", "/identity/alias", {
       body,
@@ -915,6 +1148,39 @@ export class CrossdeckClient {
    * trip happens in the background. To flush before the page unloads,
    * call flush().
    */
+  /**
+   * Emit `crossdeck.contract_failed` to the Crossdeck reliability
+   * endpoint — single-fire, one-way, never visible in the customer's
+   * dashboard. Goes over a dedicated HTTP path with the reliability
+   * publishable key embedded at build time; the customer's track()
+   * pipeline never carries `crossdeck.*` events. This is the
+   * independent-controller flow described in Privacy Policy §6
+   * ("Flow B"). The wire shape is fixed by the schema-lock contract
+   * at `contracts/diagnostics/contract-failed-payload-schema-lock.json`.
+   *
+   * Wire the call from a test hook, dogfood failure path, or
+   * customer contract-verification harness; see
+   * `contracts/README.md` for the per-test-framework hook recipes.
+   */
+  reportContractFailure(input: ContractFailureInput): void {
+    const payload: Record<string, string> = {
+      contract_id: input.contractId,
+      sdk_version: SDK_VERSION,
+      sdk_platform: "web",
+      failure_reason: input.failureReason,
+      run_context: input.runContext,
+      run_id: input.runId,
+    };
+    if (input.testRef) {
+      payload.test_file = input.testRef.file;
+      payload.test_name = input.testRef.name;
+    }
+    if (input.deviceClass) {
+      payload.device_class = input.deviceClass;
+    }
+    sendDiagnosticTelemetry(payload);
+  }
+
   track(name: string, properties?: EventProperties): void {
     const s = this.requireStarted();
     if (!name) {
@@ -1151,6 +1417,29 @@ export class CrossdeckClient {
     // from the body. Same input → same key → backend short-
     // circuits with idempotent_replay: true on retry.
     const idempotencyKey = deriveIdempotencyKeyForPurchase(body);
+
+    // ────────────────────────────────────────────────────────────
+    // Hot-path verifier: idempotency-key-deterministic re-derives the
+    // key from the same input and compares against what the SDK
+    // computed. Identical → contract honoured. Drift → bug.
+    // ────────────────────────────────────────────────────────────
+    if (this.verifiers && this.verifierReporter && this.verifierCtx) {
+      const stableId =
+        rail === "apple"
+          ? (body as { signedTransactionInfo?: string }).signedTransactionInfo ?? ""
+          : (body as { purchaseToken?: string }).purchaseToken ?? "";
+      runOnSyncPurchases(
+        this.verifiers,
+        this.verifierReporter,
+        this.verifierCtx,
+        {
+          rail,
+          stableIdentifier: stableId,
+          derivedKey: idempotencyKey,
+        },
+      );
+    }
+
     const result = await s.http.request<PurchaseResult>("POST", "/purchases/sync", {
       body,
       idempotencyKey,

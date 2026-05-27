@@ -11,6 +11,15 @@ export { CrossdeckError } from "./errors";
 export { MemoryStorage } from "./storage";
 export { SDK_NAME, SDK_VERSION, DEFAULT_BASE_URL } from "./http";
 export { CROSSDECK_ERROR_CODES, getErrorCode } from "./error-codes";
+export { CrossdeckContracts } from "./contracts";
+export type {
+  Contract,
+  ContractPillar,
+  ContractStatus,
+  ContractAppliesTo,
+  ContractTestRef,
+  ContractFailureInput,
+} from "./contracts";
 
 export type {
   CrossdeckOptions,

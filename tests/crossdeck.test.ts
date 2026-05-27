@@ -26,6 +26,12 @@ function newClient(opts: Partial<Parameters<CrossdeckClient["init"]>[0]> = {}) {
     environment: "sandbox",
     storage: new MemoryStorage(),
     autoHeartbeat: false,
+    // The contract verifier layer is exercised by its own dedicated
+    // suite at tests/contract-verifiers.test.ts. Disabling it here
+    // keeps the rest of the crossdeck.test.ts suite focused on the
+    // SDK surface under test (no spurious /v1/config fetches, no
+    // verifier console output polluting the spy counts).
+    disableContractAssertions: true,
     ...opts,
   });
   return c;

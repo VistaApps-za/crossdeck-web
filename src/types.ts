@@ -171,6 +171,77 @@ export interface CrossdeckOptions {
    * raw strings.
    */
   scrubPii?: boolean;
+  /**
+   * Run the contract self-verification suite at SDK boot. Defaults
+   * to `true` in development (`process.env.NODE_ENV !== "production"`),
+   * `false` in production. Pass `true` explicitly to opt-in for
+   * production (e.g. during a staging soak); pass `false` to silence
+   * the boot self-test in development.
+   *
+   * What this is: the boot self-test runs every applicable runtime
+   * verifier against an isolated test context — `EntitlementCache`,
+   * `deriveIdempotencyKeyForPurchase`, `crossdeckErrorFromResponse`,
+   * etc. are exercised against synthetic state. The customer's real
+   * SDK state is never mutated. The output proves at runtime that
+   * the platform's structural guarantees — per-user cache isolation,
+   * idempotency-key determinism, error-envelope shape, payload
+   * schema-lock — actually hold, not just in Crossdeck's CI.
+   * See `docs/contracts/index.html` for the full ledger.
+   *
+   * Boot-time PASS results print to the console iff
+   * `logVerifierResults` is `true`. Boot-time FAIL results ALWAYS
+   * print at WARN and fire `reportContractFailure(...)` to
+   * Crossdeck's reliability channel (with `verification_phase: "boot"`)
+   * — silencing a boot failure would defeat the purpose, since a
+   * structural break at boot means the SDK is broken before the
+   * customer's first user even taps. To stop the failure reporting,
+   * use `disableContractAssertions: true`. To stop the console
+   * passes, use `logVerifierResults: false`. The flags are
+   * independent.
+   */
+  verifyContractsAtBoot?: boolean;
+  /**
+   * Whether to print PASS results from the contract verifier layer
+   * to the console (`[crossdeck.identify] ✓ per-user-cache-isolation
+   * — slot rotated …`). Defaults to `true` in development, `false`
+   * in production.
+   *
+   * Cosmetic flag — controls console output only. Failure reporting
+   * to Crossdeck's reliability channel is NOT affected by this flag;
+   * a contract violation always prints at WARN and always fires
+   * `reportContractFailure(...)` regardless. To stop the reliability
+   * reporting, use `disableContractAssertions: true` instead.
+   *
+   * Pass `true` in a staging or QA build to verify the SDK is
+   * honouring its own contracts as your engineer exercises the app
+   * — every `identify()`, `track()`, `syncPurchases()` will stream
+   * a verifier line through the browser devtools console.
+   */
+  logVerifierResults?: boolean;
+  /**
+   * Disable the entire contract verifier + failure-reporting layer.
+   * Default `false`.
+   *
+   * When `false` (default): verifiers run on every hot-path SDK
+   * operation (identify / track / syncPurchases / isEntitled / error
+   * parse). PASS results are silent unless `logVerifierResults` is
+   * `true`. FAIL results always print at WARN AND fire
+   * `reportContractFailure(...)` to Crossdeck's reliability endpoint
+   * over a single-fire one-way path. This is the independent-
+   * controller flow described in Privacy Policy §6 ("Flow B"); the
+   * payload is schema-locked to contain no end-user identifiers.
+   *
+   * When `true`: every verifier is disabled. The runtime continues
+   * to behave correctly — verifiers are observers, not assertions
+   * — but the verification + reporting layer is silent end-to-end.
+   * No console output, no telemetry, no reliability-channel writes.
+   *
+   * Use this only if your sovereignty posture forbids any outbound
+   * diagnostic telemetry to third-party controllers. This is NOT
+   * the right tool for silencing the console — for that, set
+   * `logVerifierResults: false` and leave this flag untouched.
+   */
+  disableContractAssertions?: boolean;
 }
 
 /** Auto-tracking flags. See CrossdeckOptions.autoTrack. */

@@ -254,6 +254,100 @@ Diagnostic snapshot — useful for development consoles and bug reports:
 }
 ```
 
+## Bank-grade contracts
+
+The SDK ships its own contracts registry — every behavioural guarantee the SDK makes (per-user cache isolation, deterministic Idempotency-Key, queue durability, etc.) lives in `contracts/**/*.json` at the monorepo root and is **bundled into every release**. The customer's lockfile pins SDK code + contracts atomically — drift between what the SDK does and what it claims is structurally impossible. See [`contracts/README.md`](https://github.com/VistaApps-za/crossdeck/blob/main/contracts/README.md) for the full architecture.
+
+### `CrossdeckContracts` — typed access to the bundled registry
+
+```ts
+import { CrossdeckContracts } from "@cross-deck/web";
+
+CrossdeckContracts.all();                              // enforced contracts only
+CrossdeckContracts.allIncludingHistorical();           // + proposed + retired
+CrossdeckContracts.byId("per-user-cache-isolation");
+CrossdeckContracts.byPillar("entitlements");
+CrossdeckContracts.withStatus("proposed");
+CrossdeckContracts.findByTestName("identify(B) makes A's entitlements unreachable from in-memory");
+CrossdeckContracts.sdkVersion;        // "1.5.0"
+CrossdeckContracts.bundledIn;         // "@cross-deck/web@1.5.0"
+```
+
+The `Contract` type is exported alongside; the binary-stability promise (which fields are guaranteed across patch/minor releases) is documented inline on `src/contracts.ts` and in [`contracts/README.md`](https://github.com/VistaApps-za/crossdeck/blob/main/contracts/README.md).
+
+### `Crossdeck.reportContractFailure(input)` — surface contract test failures
+
+When a contract test asserts and fails — in your CI, a dogfood run, or a customer integration test — fire a typed `crossdeck.contract_failed` event over the **Crossdeck reliability channel**. This is one-way operational telemetry to the Crossdeck operations team (Privacy Policy §6, "Flow B"); it never enters your `track()` pipeline, never shows in your dashboard, never bills against your event quota. The wire shape is schema-locked at [`contracts/diagnostics/contract-failed-payload-schema-lock.json`](https://github.com/VistaApps-za/crossdeck/blob/main/contracts/diagnostics/contract-failed-payload-schema-lock.json):
+
+```ts
+Crossdeck.reportContractFailure({
+  contractId: "per-user-cache-isolation",
+  failureReason: "expected isolation across user switch, got cross-read",
+  runContext: process.env.CI ? "ci" : "dogfood",
+  runId: process.env.GITHUB_RUN_ID ?? crypto.randomUUID(),
+  testRef: {
+    file: "tests/entitlement-cache-isolation.test.ts",
+    name: "identify(B) makes A's entitlements unreachable from in-memory",
+  },
+});
+```
+
+No new endpoint, no special ingest path — the event lands in the same pipeline every other `track()` call does. It surfaces immediately in the dashboard's live event feed, the breakdown chart (group by `contract_id`, `sdk_platform`), and any alert rule with `event = crossdeck.contract_failed`.
+
+Properties stamped on the wire:
+
+| Property | Source |
+|----------|--------|
+| `contract_id` | caller |
+| `sdk_version`, `sdk_platform` | auto-stamped by the SDK |
+| `failure_reason`, `run_context`, `run_id` | caller |
+| `test_file`, `test_name` | set when `testRef` is provided |
+| `device_class` | optional, set by caller (categorical bucket) |
+| `verification_phase` | auto-stamped when the runtime verifier layer (below) is the source — `boot` or `hot_path` |
+
+The wire shape is locked by [`contracts/diagnostics/contract-failed-payload-schema-lock.json`](https://github.com/VistaApps-za/crossdeck/blob/main/contracts/diagnostics/contract-failed-payload-schema-lock.json); per-SDK assertion tests gate it on every release.
+
+For per-test-framework hooks (Vitest `afterEach`, etc.) see [`contracts/README.md` § Reporting contract failures](https://github.com/VistaApps-za/crossdeck/blob/main/contracts/README.md#reporting-contract-failures-back-to-crossdeck).
+
+### Runtime self-verification (v1.5.1+)
+
+The Web SDK actively tests its own structural contracts at runtime — not just in Crossdeck's CI. Every `init()` runs a boot self-test; every relevant SDK operation (`identify()`, `track()`, `syncPurchases()`, error parse) is observed by a hot-path verifier that asserts the contract claim held. PASS results stream to your devtools console; FAIL results stream silently to Crossdeck's reliability workspace via a dedicated one-way channel that never touches your appId, your dashboard, or your event quota.
+
+```ts
+Crossdeck.init({
+  appId: "app_web_xxx",
+  publicKey: "cd_pub_test_xxx",
+  environment: "sandbox",
+  // Defaults shown — both are true in dev (NODE_ENV !== "production"),
+  // false in production. Set explicitly to override.
+  verifyContractsAtBoot: true,   // run the boot self-test on init
+  logVerifierResults: true,      // print PASS lines to console
+  // Sovereignty kill-switch — disables the entire layer end-to-end:
+  // no verifiers run, no console output, no reliability-channel
+  // writes. Default false.
+  disableContractAssertions: false,
+});
+```
+
+What you'll see in your devtools console (with `logVerifierResults: true`):
+
+```
+[crossdeck] Contract self-verification — running 5 tests
+   ✓ per-user-cache-isolation — slot rotated A:7c44…ee20 → B:a3f2…01b9
+   ✓ idempotency-key-deterministic — apple JWS → a66b1640-…
+   ✓ error-envelope-shape — { type, code, message, request_id } parsed
+   ✓ flush-interval-parity — eventFlushIntervalMs = 2000ms
+   ✓ super-property-merge-precedence — caller > super > device
+[crossdeck] Self-verification passed — 5 passed, 0 failed (8ms)
+
+[crossdeck.identify] ✓ per-user-cache-isolation — slot rotated _anon → a3f2…01b9
+[crossdeck.track]    ✓ super-property-merge-precedence — caller(2) > super(1) > device
+```
+
+**Operator's-view configuration.** The same `verifyContractsAtBoot` + `logVerifierResults` flags are exposed as a per-app remote config in the dashboard at [/dashboard/apps/](https://cross-deck.com/dashboard/apps/). Flip a toggle there and the next SDK boot picks it up — no code change, no redeploy. Code wins on precedence (`code option > dashboard remote config > DEBUG/RELEASE default`), so engineers retain ultimate control. `disableContractAssertions` is intentionally code-only — see [docs/contracts/ § sovereignty](https://cross-deck.com/docs/contracts/#runtime-sovereignty).
+
+Full architecture + per-verifier walkthrough at [docs/contracts/ § Runtime self-verification](https://cross-deck.com/docs/contracts/#runtime).
+
 ## Errors
 
 Every async method can throw `CrossdeckError`. Synchronous methods throw on configuration mistakes (calling before `init()`, invalid key prefix, env mismatch).

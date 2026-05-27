@@ -82,12 +82,54 @@ const distDir = path.resolve(new URL(".", import.meta.url).pathname, "../dist");
 // code instead of `undefined`. ~1 KB gzipped. Raise core ESM
 // 39 → 41, core CJS 40 → 42, react/vue ESM 39 → 41, UMD 21 → 23.
 // Still well below every single-pillar competitor's ceiling.
+//
+// Budgets nudged again v1.5.0 (May 2026) — CrossdeckContracts
+// public API + bundled-contracts snapshot. The SDK now ships every
+// bank-grade contract that applies to it as a typed, queryable
+// dataset (CrossdeckContracts.all/byId/byPillar/withStatus/
+// findByTestName + reportContractFailure helper). The JSON payload
+// of 7 contracts alone is ~13 KB raw / ~3 KB gzipped; query helpers
+// + types add a fraction of a KB. Trade-off accepted: shipping the
+// contract registry inside every release is what makes
+// "drift between SDK code and the contracts it claims" structurally
+// impossible — same atomic-versioning logic Stripe uses for its
+// API surface. Raise core ESM 41 → 45, core CJS 42 → 45, react/vue
+// ESM 41 → 45, UMD 23 → 26. Still well below every single-pillar
+// competitor's ceiling (Mixpanel 55, Sentry 30 errors-only, PostHog
+// 40 analytics-only) for a one-bundle, three-pillar SDK that now
+// also ships its own verification dataset.
+//
+// Budgets nudged again v1.5.1 (May 2026) — runtime contract verifier
+// layer. The SDK now self-tests its own structural contracts at
+// runtime: per-user cache isolation, idempotency-key determinism,
+// error-envelope shape, flush-interval parity, super-property merge
+// precedence. Verifiers run on every relevant SDK operation
+// (identify / syncPurchases / track / error parse), emit PASS lines
+// to the developer's console when logVerifierResults is true, and
+// fire reportContractFailure to the reliability channel on FAIL.
+// Three new CrossdeckOptions flags (verifyContractsAtBoot,
+// logVerifierResults, disableContractAssertions). ~6 KB gzipped of
+// real code — the framework (VerifierReporter, dispatchers,
+// observation types) is ~2 KB; the five verifier implementations
+// + their evidence strings are ~4 KB.
+//
+// Trade-off accepted: shipping runtime self-verification inside
+// every release is the structural difference between "we have CI
+// tests for these contracts" and "every install in the field tests
+// these contracts as it operates and reports failures to us". The
+// platform-hardening signal is the moat; the bundle bytes are the
+// rent.
+//
+// Raise core ESM 45 → 55, core CJS 45 → 55, react/vue ESM 45 → 55,
+// UMD 26 → 32. Still under every named competitor's ceiling for a
+// one-bundle, three-pillar SDK that ships its own verification
+// dataset AND self-verifies at runtime.
 const BUDGETS = [
-  { file: "index.mjs", maxGzipKb: 41, label: "core ESM" },
-  { file: "index.cjs", maxGzipKb: 42, label: "core CJS" },
-  { file: "react.mjs", maxGzipKb: 41, label: "react ESM" },
-  { file: "vue.mjs", maxGzipKb: 41, label: "vue ESM" },
-  { file: "crossdeck.umd.min.js", maxGzipKb: 23, label: "UMD min" },
+  { file: "index.mjs", maxGzipKb: 55, label: "core ESM" },
+  { file: "index.cjs", maxGzipKb: 55, label: "core CJS" },
+  { file: "react.mjs", maxGzipKb: 55, label: "react ESM" },
+  { file: "vue.mjs", maxGzipKb: 55, label: "vue ESM" },
+  { file: "crossdeck.umd.min.js", maxGzipKb: 32, label: "UMD min" },
 ];
 
 let failed = false;
