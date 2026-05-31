@@ -135,12 +135,20 @@ const distDir = path.resolve(new URL(".", import.meta.url).pathname, "../dist");
 // the old 55 ceiling. Raise core ESM + CJS 55 → 58 for a ~2 KB margin.
 // react/vue ESM (48.6 / 48.4) and UMD (31.4) stay comfortably under and
 // are left unchanged.
+//
+// Budget nudged again (May 2026) — the per-(contract×SDK) runtimeVerified
+// flag + a 7th runtime verifier (sdk-error-codes-catalogue: a frozen list
+// of the 15 backend wire codes it asserts the catalogue covers). ~0.4 KB
+// gzipped of real verification code. UMD min landed at 32.32 over the old
+// 32 ceiling; raise UMD 32 → 33 for margin. core ESM (56.5) / CJS (57.0) /
+// react (51.5) / vue (51.2) all stay under their ceilings, unchanged. This
+// is the moat paying rent again: another contract the SDK now tests live.
 const BUDGETS = [
   { file: "index.mjs", maxGzipKb: 58, label: "core ESM" },
   { file: "index.cjs", maxGzipKb: 58, label: "core CJS" },
   { file: "react.mjs", maxGzipKb: 55, label: "react ESM" },
   { file: "vue.mjs", maxGzipKb: 55, label: "vue ESM" },
-  { file: "crossdeck.umd.min.js", maxGzipKb: 32, label: "UMD min" },
+  { file: "crossdeck.umd.min.js", maxGzipKb: 33, label: "UMD min" },
 ];
 
 let failed = false;

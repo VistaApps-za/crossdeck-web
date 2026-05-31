@@ -203,6 +203,18 @@ describe("Per-verifier bootTest happy paths", () => {
       expect(result.evidence).toContain("caller > super > device");
     }
   });
+
+  it("sdk-error-codes-catalogue covers every backend wire code with remediation", async () => {
+    const v = STATIC_VERIFIERS.find(
+      (x) => x.contractId === "sdk-error-codes-catalogue",
+    );
+    expect(v).toBeDefined();
+    const result = await v!.bootTest!();
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.evidence).toContain("backend wire codes");
+    }
+  });
 });
 
 // ----------------------------------------------------------------------

@@ -248,6 +248,24 @@ export class AutoTracker {
   markActivity(): void {
     if (!this.session) return;
     const now = Date.now();
+    // If this activity lands AFTER the resume window has lapsed, it belongs to
+    // a NEW visit — roll the session BEFORE the event records, so a single
+    // stored session can never span a >30-min gap (the contract's
+    // session_gap_within_window invariant). This covers the case the
+    // visibility/page-load resume checks miss entirely: a tab left open and
+    // idle, then interacted with again, with no visibility transition. We do
+    // NOT back-date a session.ended onto the prior session — that would itself
+    // open the gap; its end is inferred from its last event (same as the
+    // page-load resume path). session.started is emitted here, before the
+    // triggering event is stamped (timestamp is set later in track()), so it
+    // is the earliest event of the new session.
+    if (now - this.session.lastActivityAt >= SESSION_RESUME_THRESHOLD_MS) {
+      this.pageviewId = null;
+      this.session = this.startNewSession();
+      this.persistSession();
+      this.emitSessionStart();
+      return;
+    }
     this.session.lastActivityAt = now;
     if (now - this.lastPersistAt >= ACTIVITY_PERSIST_THROTTLE_MS) {
       this.persistSession();
@@ -325,11 +343,13 @@ export class AutoTracker {
         // is the last tracked event, so this is the true idle gap.
         const idleFor = Date.now() - this.session.lastActivityAt;
         if (idleFor >= SESSION_RESUME_THRESHOLD_MS) {
-          // Long idle → the previous session genuinely ended. Emit its
-          // end, then open a fresh one. Null pageviewId on the boundary
-          // (audit P1 #16) so any event between resume and the next
-          // page.viewed doesn't ship the previous session's attribution.
-          this.emitSessionEnd();
+          // Long idle → the previous session genuinely ended. Open a fresh
+          // one. Do NOT back-date a session.ended onto the prior session: it
+          // would land >30 min after that session's last real event and open
+          // an intra-session gap (session_gap_within_window). Its end is
+          // inferred from its last event — consistent with the page-load
+          // resume path. Null pageviewId on the boundary (audit P1 #16) so any
+          // event before the next page.viewed doesn't ship stale attribution.
           this.pageviewId = null;
           this.session = this.startNewSession();
           this.persistSession();

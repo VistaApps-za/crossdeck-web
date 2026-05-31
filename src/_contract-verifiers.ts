@@ -59,6 +59,7 @@ import {
   formatAsUuid,
 } from "./idempotency-key";
 import { sha256Hex } from "./hash";
+import { getErrorCode } from "./error-codes";
 import { sendDiagnosticTelemetry } from "./_diagnostic-telemetry";
 import { SDK_NAME, SDK_VERSION } from "./_version";
 
@@ -992,6 +993,84 @@ const VERIFIER_CONTRACT_FAILED_PAYLOAD_SCHEMA_LOCK: ContractVerifier = {
 // ============================================================================
 // Registry — the verifiers this SDK ships.
 // ============================================================================
+// VERIFIER 7 — sdk-error-codes-catalogue
+// ============================================================================
+
+/**
+ * The backend-emitted wire codes the SDK catalogue MUST carry remediation
+ * for. Source of truth: backend/src/api/v1-errors.ts ApiErrorCode — kept in
+ * lockstep with the CI backfill test (error-codes-backfill.test.ts). A
+ * developer who hits one of these from the backend must get a canonical
+ * "what does this mean / what should I do" answer from getErrorCode(), not
+ * undefined.
+ */
+const BACKEND_WIRE_CODES: readonly string[] = Object.freeze([
+  "missing_api_key",
+  "invalid_api_key",
+  "key_revoked",
+  "identity_token_invalid",
+  "origin_not_allowed",
+  "bundle_id_not_allowed",
+  "package_name_not_allowed",
+  "env_mismatch",
+  "idempotency_key_in_use",
+  "rate_limited",
+  "internal_error",
+  "google_not_supported",
+  "stripe_not_supported",
+  "missing_required_param",
+  "invalid_param_value",
+]);
+
+/**
+ * Boot self-test: the error-codes catalogue carries a usable entry
+ * (non-empty description AND resolution) for every backend wire code.
+ * Completeness is a boot-time property of the static catalogue, so there
+ * is no hot-path hook. CI's backfill test proves the same property at
+ * build time; this verifier proves it lives in the shipped artifact a
+ * customer actually loaded.
+ */
+const VERIFIER_SDK_ERROR_CODES_CATALOGUE: ContractVerifier = {
+  contractId: "sdk-error-codes-catalogue",
+  bootTest(): VerifierResult {
+    const t0 = nowMs();
+    try {
+      const missing: string[] = [];
+      for (const code of BACKEND_WIRE_CODES) {
+        const entry = getErrorCode(code);
+        if (
+          !entry ||
+          !entry.description ||
+          entry.description.trim().length === 0 ||
+          !entry.resolution ||
+          entry.resolution.trim().length === 0
+        ) {
+          missing.push(code);
+        }
+      }
+      if (missing.length > 0) {
+        return fail(
+          "sdk-error-codes-catalogue",
+          `catalogue missing description+resolution for backend code(s): ${missing.join(", ")}`,
+          nowMs() - t0,
+        );
+      }
+      return pass(
+        "sdk-error-codes-catalogue",
+        `all ${BACKEND_WIRE_CODES.length} backend wire codes carry description + resolution`,
+        nowMs() - t0,
+      );
+    } catch (err) {
+      return fail(
+        "sdk-error-codes-catalogue",
+        `boot test threw: ${(err as Error).message?.slice(0, 80) ?? "unknown error"}`,
+        nowMs() - t0,
+      );
+    }
+  },
+};
+
+// ============================================================================
 
 /**
  * Every static verifier shipped by the Web SDK. The
@@ -1006,6 +1085,7 @@ export const STATIC_VERIFIERS: readonly ContractVerifier[] = Object.freeze([
   VERIFIER_FLUSH_INTERVAL_PARITY,
   VERIFIER_SUPER_PROPERTY_MERGE_PRECEDENCE,
   VERIFIER_CONTRACT_FAILED_PAYLOAD_SCHEMA_LOCK,
+  VERIFIER_SDK_ERROR_CODES_CATALOGUE,
 ]);
 
 // ============================================================================

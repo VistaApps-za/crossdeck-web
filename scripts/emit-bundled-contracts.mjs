@@ -47,6 +47,59 @@ function collectContracts(dir) {
 const sdkVersion = readSdkVersion();
 const bundledIn = `@cross-deck/${SDK_IDENTIFIER}@${sdkVersion}`;
 
+/**
+ * Derive the set of contract ids THIS SDK verifies at runtime, straight
+ * from the verifier registry (`STATIC_VERIFIERS` in _contract-verifiers.ts).
+ *
+ * The whole point of `runtimeVerified` is that the registry can't disagree
+ * with what actually runs — so it MUST be derived from the registration
+ * itself, never hand-maintained. We parse the STATIC_VERIFIERS array for
+ * its `VERIFIER_*` members, then resolve each to its `contractId`. Add a
+ * verifier to STATIC_VERIFIERS and the flag flips automatically on the
+ * next build; forget to wire one and it stays honestly `false`.
+ *
+ * Fails loudly on any parse gap (a member we can't resolve to a
+ * contractId) so a refactor can't silently produce wrong flags.
+ */
+function deriveRuntimeVerifiedIds() {
+  const verifiersFile = path.join(srcDir, "_contract-verifiers.ts");
+  const src = fs.readFileSync(verifiersFile, "utf8");
+
+  const arrMatch = src.match(
+    /STATIC_VERIFIERS[^=]*=\s*Object\.freeze\(\s*\[([\s\S]*?)\]\s*\)/,
+  );
+  if (!arrMatch) {
+    console.error("[emit-bundled-contracts] could not locate STATIC_VERIFIERS array");
+    process.exit(1);
+  }
+  const members = [...arrMatch[1].matchAll(/\b(VERIFIER_[A-Z0-9_]+)\b/g)].map(
+    (m) => m[1],
+  );
+  if (members.length === 0) {
+    console.error("[emit-bundled-contracts] STATIC_VERIFIERS is empty — refusing to emit");
+    process.exit(1);
+  }
+
+  const ids = new Set();
+  for (const name of members) {
+    const def = src.match(
+      new RegExp(
+        `const\\s+${name}\\s*:\\s*ContractVerifier\\s*=\\s*\\{[\\s\\S]*?contractId:\\s*["']([^"']+)["']`,
+      ),
+    );
+    if (!def) {
+      console.error(
+        `[emit-bundled-contracts] could not resolve contractId for verifier ${name} — STATIC_VERIFIERS and the registry would drift; aborting`,
+      );
+      process.exit(1);
+    }
+    ids.add(def[1]);
+  }
+  return ids;
+}
+
+const runtimeVerifiedIds = deriveRuntimeVerifiedIds();
+
 const matching = [];
 for (const file of collectContracts(contractsRoot)) {
   const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -55,7 +108,11 @@ for (const file of collectContracts(contractsRoot)) {
     process.exit(1);
   }
   if (parsed.appliesTo.includes(SDK_IDENTIFIER)) {
-    matching.push({ ...parsed, bundledIn });
+    matching.push({
+      ...parsed,
+      bundledIn,
+      runtimeVerified: runtimeVerifiedIds.has(parsed.id),
+    });
   }
 }
 matching.sort((a, b) => a.id.localeCompare(b.id));

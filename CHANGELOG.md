@@ -2,6 +2,43 @@
 
 All notable changes to `@cross-deck/web` will be documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] — 2026-05-31
+
+Session-boundary correctness, plus the per-platform contract runtime status
+that had been sitting unreleased. No public API change; `session.ended`
+emission timing changes as described, so read before upgrading if you key
+downstream logic on it.
+
+**A tab left open and idle, then used again, no longer stretches one session
+across the gap.** `markActivity()` now rolls to a new session when an event
+lands after the 30-minute inactivity window has lapsed — covering the case the
+page-load and tab-return resume checks miss entirely (a tab kept open and idle,
+then interacted with, with no visibility transition). A single stored session
+can no longer contain a >30-minute gap.
+
+**Returning to a long-idle tab no longer back-dates `session.ended`.** The
+visibility-resume path emitted `session.ended` at the moment of return — more
+than 30 minutes after the session's last real event — which itself opened an
+intra-session gap. The prior session now ends implicitly (its end inferred from
+its last event), consistent with the page-load resume path. If you key
+downstream logic on `session.ended`, note it no longer fires on a >30-minute
+tab-return.
+
+**Per-platform contract runtime status + a 7th live verifier.** Each bundled
+
+**Per-platform contract runtime status + a 7th live verifier.** Each bundled
+contract now carries `runtimeVerified` — whether *this* SDK self-verifies it
+at runtime vs. proving it in CI only. It is derived at build time from the
+SDK's `STATIC_VERIFIERS` registry (never hand-set), so the registry can't
+disagree with what actually runs. `CrossdeckContracts` consumers can read it
+to distinguish "watch it pass live" from "CI-proven every release".
+
+- New runtime verifier `sdk-error-codes-catalogue` (boot self-test: every
+  backend wire code carries a description + resolution in the shipped
+  catalogue). Web now self-verifies **7** contracts live.
+- Bundle-size budget: UMD min 32 → 33 KB (~0.4 KB gzipped for the flag + the
+  new verifier's frozen 15-code list). Other bundles unchanged, under budget.
+
 ## [1.6.0] — 2026-05-30
 
 Minor — two autocapture fidelity fixes. No public API change; event

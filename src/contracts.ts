@@ -88,6 +88,21 @@ export interface Contract {
   readonly firstRegisteredIn: string;
   /** The SDK release this snapshot was bundled with, stamped at build time. */
   readonly bundledIn: string;
+  /**
+   * Whether THIS SDK self-verifies this contract at runtime (a verifier is
+   * registered in the SDK's `STATIC_VERIFIERS` harness, emitting
+   * `crossdeck.contract_failed` live), vs. proven by CI tests only.
+   *
+   * DERIVED at bundle time from the verifier registry — never hand-set —
+   * so the registry can never disagree with what actually runs. Runtime
+   * status is a property of (contract × SDK): the same contract can be
+   * `true` here (web) and `false` in another SDK that lacks the harness.
+   *
+   * `true`  → surfaces in the console as "watch it pass live".
+   * `false` → "CI-proven every release" (still enforced, just not a
+   *           live toggle on this platform).
+   */
+  readonly runtimeVerified: boolean;
 }
 
 /**

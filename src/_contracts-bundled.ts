@@ -129,7 +129,8 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
       "legal/security/index.html#diagnostic",
       "legal/sdk-data/index.html#b-diagnostic"
     ],
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": true
   },
   {
     "id": "error-envelope-shape",
@@ -168,7 +169,8 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     ],
     "registeredAt": "2026-05-26",
     "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 8 (codifies existing contract)",
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": true
   },
   {
     "id": "flush-interval-parity",
@@ -213,7 +215,8 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     ],
     "registeredAt": "2026-05-26",
     "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 3.3",
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": true
   },
   {
     "id": "idempotency-key-deterministic",
@@ -318,7 +321,8 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     ],
     "registeredAt": "2026-05-26",
     "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 2.2.a + 2.2.b + 2.2.c",
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": true
   },
   {
     "id": "init-reentry-drains-prior-queue",
@@ -345,7 +349,8 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     ],
     "registeredAt": "2026-05-26",
     "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 5.5",
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": false
   },
   {
     "id": "per-user-cache-isolation",
@@ -424,7 +429,8 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     ],
     "registeredAt": "2026-05-26",
     "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 1.3 (web/RN) + dogfood-gap fix (swift + android)",
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": true
   },
   {
     "id": "sdk-error-codes-catalogue",
@@ -438,9 +444,14 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     "codeRef": [
       "sdks/web/src/error-codes.ts",
       "sdks/node/src/error-codes.ts",
+      "sdks/web/src/_contract-verifiers.ts",
       "backend/src/api/v1-errors.ts"
     ],
     "testRef": [
+      {
+        "file": "sdks/web/tests/contract-verifiers.test.ts",
+        "name": "sdk-error-codes-catalogue covers every backend wire code with remediation"
+      },
       {
         "file": "sdks/web/tests/error-codes-backfill.test.ts",
         "name": "includes backend code"
@@ -464,7 +475,50 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     ],
     "registeredAt": "2026-05-26",
     "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 6.2",
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": true
+  },
+  {
+    "id": "super-property-merge-precedence",
+    "pillar": "analytics",
+    "status": "enforced",
+    "claim": "Every Crossdeck SDK merges event properties with the precedence device < super < caller (caller-supplied values win over registered super-properties, which win over auto-attached device info). Pre-v1.4.0 Swift had it INVERTED (super < device < caller — device clobbered super), so a `register('plan', 'pro')` super-property was silently overridden by auto-attached device fields whenever keys collided. Cross-SDK funnel queries on super-property keys returned different answers per platform.",
+    "appliesTo": [
+      "web",
+      "swift"
+    ],
+    "codeRef": [
+      "sdks/web/src/super-properties.ts",
+      "sdks/web/src/_contract-verifiers.ts",
+      "sdks/swift/Sources/Crossdeck/EventPropertyMerge.swift",
+      "sdks/swift/Sources/Crossdeck/Crossdeck.swift"
+    ],
+    "testRef": [
+      {
+        "file": "sdks/web/tests/contract-verifiers.test.ts",
+        "name": "super-property-merge-precedence verifies caller > super > device"
+      },
+      {
+        "file": "sdks/swift/Tests/CrossdeckTests/EventPropertyMergeTests.swift",
+        "name": "test_super_overrides_device"
+      },
+      {
+        "file": "sdks/swift/Tests/CrossdeckTests/EventPropertyMergeTests.swift",
+        "name": "test_caller_overrides_super"
+      },
+      {
+        "file": "sdks/swift/Tests/CrossdeckTests/EventPropertyMergeTests.swift",
+        "name": "test_full_precedence_chain"
+      },
+      {
+        "file": "sdks/swift/Tests/CrossdeckTests/EventPropertyMergeTests.swift",
+        "name": "test_matchesWebNodeRNPrecedence"
+      }
+    ],
+    "registeredAt": "2026-05-26",
+    "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 3.2",
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": true
   },
   {
     "id": "sync-purchases-funnel-parity",
@@ -497,6 +551,7 @@ export const BUNDLED_CONTRACTS: readonly Contract[] = Object.freeze([
     ],
     "registeredAt": "2026-05-26",
     "firstRegisteredIn": "bank-grade reconciliation v1.4.0 — phase 3.5",
-    "bundledIn": "@cross-deck/web@1.6.0"
+    "bundledIn": "@cross-deck/web@1.6.0",
+    "runtimeVerified": false
   }
 ]) as readonly Contract[];
